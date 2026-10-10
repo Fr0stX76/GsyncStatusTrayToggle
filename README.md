@@ -23,7 +23,7 @@ Not affiliated with NVIDIA.
 
 ## Usage
 
-Download `GsyncStatusTrayToggle.exe` from the Releases page and run it.
+Download the zip from the Releases page, extract it and run GsyncStatusTrayToggle.exe.
 
 - **Left-click:** G-SYNC on or off.
 - **Right-click:** Fullscreen, Fullscreen + Windowed, Start with Windows, Exit.
