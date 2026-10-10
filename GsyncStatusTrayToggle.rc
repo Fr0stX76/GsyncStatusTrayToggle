@@ -1,0 +1,44 @@
+#pragma code_page(65001)
+#include <windows.h>
+#include "resource.h"
+
+IDI_ICON_OFF            ICON "gsync_off.ico"
+IDI_ICON_FULLSCREEN     ICON "gsync_fullscreen.ico"
+IDI_ICON_WINDOWED       ICON "gsync_windowed.ico"
+IDI_ICON_UNKNOWN        ICON "gsync_unknown.ico"
+IDI_ICON_OFF_LIGHT      ICON "gsync_off_light.ico"
+IDI_ICON_UNKNOWN_LIGHT  ICON "gsync_unknown_light.ico"
+
+1 24 "GsyncStatusTrayToggle.manifest"
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Fr0stX76"
+            VALUE "FileDescription", "GsyncStatusTrayToggle"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "GsyncStatusTrayToggle"
+            VALUE "LegalCopyright", "Copyright © 2026 Fr0stX76"
+            VALUE "OriginalFilename", "GsyncStatusTrayToggle.exe"
+            VALUE "ProductName", "GsyncStatusTrayToggle"
+            VALUE "ProductVersion", "1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
+
