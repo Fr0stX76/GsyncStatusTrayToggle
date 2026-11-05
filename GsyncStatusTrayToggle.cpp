@@ -2,6 +2,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <objbase.h>
 #include <process.h>
 #include <utility>
@@ -27,14 +28,10 @@ constexpr ULONGLONG ClickDelay = 5000;
 constexpr wchar_t InstanceName[] = L"Local\\GsyncStatusTrayToggle.Instance";
 constexpr wchar_t WindowClass[] = L"GsyncStatusTrayToggleClass";
 constexpr wchar_t AppName[] = L"GsyncStatusTrayToggle";
-constexpr wchar_t DriverKey[] = L"SYSTEM\\CurrentControlSet\\Services\\nvlddmkm\\State";
-constexpr wchar_t DriverValue[] = L"0x1194f158";
+constexpr wchar_t DrsFolder[] = L"%ProgramData%\\NVIDIA Corporation\\Drs";
 constexpr wchar_t SettingsKey[] = L"Software\\GsyncStatusTrayToggle";
 constexpr wchar_t SettingsValue[] = L"ToggleMode";
-constexpr wchar_t StartupKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-constexpr wchar_t StartupApprovedKey[] =
-    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
-constexpr DWORD StartupCommandLimit = 260;
+constexpr wchar_t StartupTask[] = L"GsyncStatusTrayToggle";
 
 class Handle {
 public:
@@ -49,16 +46,6 @@ public:
     void Reset(HANDLE h = nullptr) {
         if (*this) CloseHandle(value);
         value = h;
-    }
-};
-
-struct RegKey {
-    HKEY value = nullptr;
-    ~RegKey() { Reset(); }
-
-    void Reset() {
-        if (value) RegCloseKey(value);
-        value = nullptr;
     }
 };
 
@@ -80,9 +67,7 @@ static unsigned g_trayRetries = 0;
 static Mode g_preference = Mode::Fullscreen;
 static bool g_preferenceErrorShown = false;
 
-static RegKey g_driverKey;
 static Handle g_watchStop;
-static Handle g_watchRegistry;
 static Handle g_watchThread;
 static std::atomic<bool> g_refreshQueued{false};
 static std::atomic<DWORD> g_watchError{ERROR_SUCCESS};
@@ -176,44 +161,35 @@ static void ObserveActiveMode(State state) {
     if (gsync::IsOn(state)) SetPreference(gsync::StateMode(state));
 }
 
-static bool StartupDisabledByWindows() {
-    BYTE data[64]{};
-    DWORD size = sizeof(data);
-    const LSTATUS rc =
-        RegGetValueW(HKEY_CURRENT_USER, StartupApprovedKey, AppName, RRF_RT_REG_BINARY, nullptr, data, &size);
-    if (rc != ERROR_SUCCESS) return false;
-    return size >= 1 && (data[0] == 0x03 || data[0] == 0x07);
-}
-
 struct StartupState {
     bool known = false;
     bool enabled = false;
-    std::wstring command;
 };
 
+// Runs schtasks.exe without a window and returns its exit code, or -1.
+static int RunSchtasks(const std::wstring& args) {
+    wchar_t system[MAX_PATH]{};
+    if (!GetSystemDirectoryW(system, MAX_PATH)) return -1;
+    std::wstring exe = std::wstring(system) + L"\\schtasks.exe";
+    std::wstring line = L"\"" + exe + L"\" " + args;
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe.c_str(), line.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+        return -1;
+    DWORD code = static_cast<DWORD>(-1);
+    if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return static_cast<int>(code);
+}
+
+// A logon task with highest privileges starts the tray elevated without a UAC prompt.
 static StartupState ReadStartup() {
     StartupState startup;
-    wchar_t path[StartupCommandLimit + 1]{};
-    const DWORD length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
-    if (!length || length > StartupCommandLimit - 2) return startup;
-    startup.command = L"\"" + std::wstring(path, length) + L"\"";
-    const std::wstring& command = startup.command;
-
-    wchar_t stored[StartupCommandLimit + 1]{};
-    DWORD size = sizeof(stored);
-    const LSTATUS rc = RegGetValueW(HKEY_CURRENT_USER, StartupKey, AppName, RRF_RT_REG_SZ, nullptr, stored, &size);
-    if (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND || rc == ERROR_MORE_DATA ||
-        rc == ERROR_UNSUPPORTED_TYPE || rc == ERROR_INVALID_DATA) {
-        startup.known = true;
-        return startup;
-    }
-    if (rc != ERROR_SUCCESS) return startup;
-
-    const bool registered = size == (command.size() + 1) * sizeof(wchar_t) &&
-                            CompareStringOrdinal(stored, static_cast<int>(command.size()), command.c_str(),
-                                                 static_cast<int>(command.size()), TRUE) == CSTR_EQUAL;
-    startup.known = true;
-    startup.enabled = registered && !StartupDisabledByWindows();
+    const int rc = RunSchtasks(L"/Query /TN \"" + std::wstring(StartupTask) + L"\"");
+    startup.known = rc >= 0;
+    startup.enabled = rc == 0;
     return startup;
 }
 
@@ -221,37 +197,25 @@ static void ToggleStartup() {
     if (g_stopping || g_errorDialog) return;
     const StartupState startup = ReadStartup();
     if (!startup.known) return;
-    const std::wstring& command = startup.command;
-    LSTATUS rc = startup.enabled ? RegDeleteKeyValueW(HKEY_CURRENT_USER, StartupKey, AppName)
-                                 : RegSetKeyValueW(HKEY_CURRENT_USER, StartupKey, AppName, REG_SZ, command.c_str(),
-                                                   static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
-    if (startup.enabled && (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND)) rc = ERROR_SUCCESS;
-    if (rc != ERROR_SUCCESS) {
-        ShowError(
-            WindowsError(L"Unable to change the Windows startup entry of the application.", static_cast<DWORD>(rc)));
-        return;
+    std::wstring args;
+    if (startup.enabled) {
+        args = L"/Delete /F /TN \"" + std::wstring(StartupTask) + L"\"";
+    } else {
+        wchar_t path[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        if (!length || length >= MAX_PATH) return;
+        args = L"/Create /F /TN \"" + std::wstring(StartupTask) + L"\" /SC ONLOGON /RL HIGHEST /IT /TR \"\\\"" +
+               std::wstring(path) + L"\\\"\"";
     }
-    RegDeleteKeyValueW(HKEY_CURRENT_USER, StartupApprovedKey, AppName);
+    if (RunSchtasks(args) != 0) ShowError(L"Unable to change the Start with Windows task.");
 }
 
 static State ReadDriverState() {
-    for (int attempt = 0; attempt != 2; ++attempt) {
-        if (!g_driverKey.value) {
-            const LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, DriverKey, 0, KEY_QUERY_VALUE, &g_driverKey.value);
-            if (rc != ERROR_SUCCESS) return State::Unknown;
-        }
-        DWORD value = 0, type = 0, size = sizeof(value);
-        const LSTATUS rc =
-            RegQueryValueExW(g_driverKey.value, DriverValue, nullptr, &type, reinterpret_cast<LPBYTE>(&value), &size);
-        if ((rc == ERROR_KEY_DELETED || rc == ERROR_INVALID_HANDLE) && attempt == 0) {
-            g_driverKey.Reset();
-            continue;
-        }
-        if (rc == ERROR_FILE_NOT_FOUND) return gsync::DecodeState(gsync::SettingDefaults[gsync::ApplicationMode]);
-        if (rc != ERROR_SUCCESS || type != REG_DWORD || size != sizeof(value)) return State::Unknown;
-        return gsync::DecodeState(value);
+    try {
+        return gsync::ReadState();
+    } catch (...) {
+        return State::Unknown;
     }
-    return State::Unknown;
 }
 
 static void QueueRefresh() {
@@ -264,25 +228,40 @@ static DWORD NextRetry(DWORD ms) {
 }
 
 static DWORD WINAPI WatchThreadProc(LPVOID) {
-    RegKey key;
-    DWORD retry = 500;
-    HANDLE waits[] = {g_watchStop.value, g_watchRegistry.value};
-    for (;;) {
-        LSTATUS rc = ERROR_SUCCESS;
-        if (!key.value) rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, DriverKey, 0, KEY_NOTIFY, &key.value);
-        if (rc == ERROR_SUCCESS)
-            rc = RegNotifyChangeKeyValue(key.value, FALSE, REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME,
-                                         g_watchRegistry.value, TRUE);
-        g_watchError = static_cast<DWORD>(rc);
+    wchar_t folder[MAX_PATH]{};
+    if (!ExpandEnvironmentStringsW(DrsFolder, folder, MAX_PATH)) {
+        g_watchError = GetLastError();
         QueueRefresh();
-        if (rc == ERROR_SUCCESS) {
-            if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
-            retry = 500;
+        return 0;
+    }
+    DWORD retry = 500;
+    for (;;) {
+        HANDLE change = FindFirstChangeNotificationW(folder, FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME);
+        g_watchError = change == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        QueueRefresh();
+        if (change == INVALID_HANDLE_VALUE) {
+            if (WaitForSingleObject(g_watchStop.value, retry) != WAIT_TIMEOUT) break;
+            retry = NextRetry(retry);
             continue;
         }
-        key.Reset();
-        if (WaitForSingleObject(g_watchStop.value, retry) != WAIT_TIMEOUT) break;
-        retry = NextRetry(retry);
+        retry = 500;
+        HANDLE waits[] = {g_watchStop.value, change};
+        bool stop = false;
+        for (;;) {
+            if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) {
+                stop = true;
+                break;
+            }
+            // The driver rewrites several files per save; let it finish first.
+            if (WaitForSingleObject(g_watchStop.value, 300) != WAIT_TIMEOUT) {
+                stop = true;
+                break;
+            }
+            QueueRefresh();
+            if (!FindNextChangeNotification(change)) break;
+        }
+        FindCloseChangeNotification(change);
+        if (stop) break;
     }
     return 0;
 }
@@ -664,8 +643,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 static bool StartWatcher(std::wstring& error) {
     g_watchStop.Reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    g_watchRegistry.Reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
-    if (!g_watchStop || !g_watchRegistry) {
+    if (!g_watchStop) {
         error = WindowsError(L"Unable to prepare the change monitoring.", GetLastError());
         return false;
     }
@@ -687,8 +665,6 @@ static void Cleanup() {
     g_commandThread.Reset();
     g_watchThread.Reset();
     g_watchStop.Reset();
-    g_watchRegistry.Reset();
-    g_driverKey.Reset();
 
     if (g_hwnd && IsWindow(g_hwnd)) {
         RemoveTrayIcon();
@@ -701,12 +677,6 @@ static void Cleanup() {
         icon = nullptr;
     }
     g_instance.Reset();
-}
-
-static bool RegistryNeedsAdmin() {
-    RegKey key;
-    const LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, DriverKey, 0, KEY_QUERY_VALUE | KEY_NOTIFY, &key.value);
-    return rc == ERROR_ACCESS_DENIED;
 }
 
 static bool ReadElevation(TOKEN_ELEVATION_TYPE& type, std::wstring& error) {
@@ -765,7 +735,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     }
 
     std::wstring error;
-    if (RegistryNeedsAdmin()) {
+    // Saving NVIDIA settings needs admin rights.
+    {
         TOKEN_ELEVATION_TYPE elevation = TokenElevationTypeDefault;
         if (!ReadElevation(elevation, error)) {
             ShowError(error);
@@ -776,9 +747,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
             ShowError(error);
             return launched ? 0 : 1;
         }
-        if (elevation == TokenElevationTypeDefault) {
+        if (elevation == TokenElevationTypeDefault && !IsUserAnAdmin()) {
             ShowError(
-                L"The G-SYNC state can only be read with administrator rights, and this account can't get them. Start the tray from an administrator account.");
+                L"Changing G-SYNC needs administrator rights, and this account can't get them. Start the tray from an administrator account.");
             return 1;
         }
     }

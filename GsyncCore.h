@@ -171,6 +171,15 @@ inline Result ReadValues(const DrsSession& drs, Values& values) {
     return {};
 }
 
+// Newer drivers no longer mirror the mode into the registry, so ask NVAPI.
+inline State ReadState() {
+    DrsSession drs;
+    if (drs.Open().code != ExitCode::Success) return State::Unknown;
+    Values values{};
+    if (ReadValues(drs, values).code != ExitCode::Success) return State::Unknown;
+    return DecodeState(values[ApplicationMode]);
+}
+
 inline bool IsNvidia(const DISPLAYCONFIG_PATH_INFO& path) {
     DISPLAYCONFIG_ADAPTER_NAME adapter{};
     adapter.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME;
