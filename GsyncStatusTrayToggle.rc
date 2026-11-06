@@ -14,10 +14,10 @@ IDI_ICON_UNKNOWN_LIGHT  ICON "gsync_unknown_light.ico"
 LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 
 1 VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION APP_VERSION
+PRODUCTVERSION APP_VERSION
 FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
-FILEFLAGS 0x0L
+FILEFLAGS APP_FILE_FLAGS
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 FILESUBTYPE 0x0L
@@ -28,12 +28,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Fr0stX76"
             VALUE "FileDescription", "GsyncStatusTrayToggle"
-            VALUE "FileVersion", "1.0.0.0"
+            VALUE "FileVersion", APP_VERSION_TEXT
             VALUE "InternalName", "GsyncStatusTrayToggle"
             VALUE "LegalCopyright", "Copyright © 2026 Fr0stX76"
             VALUE "OriginalFilename", "GsyncStatusTrayToggle.exe"
             VALUE "ProductName", "GsyncStatusTrayToggle"
-            VALUE "ProductVersion", "1.0.0"
+            VALUE "ProductVersion", APP_PRODUCT_VERSION
         END
     END
     BLOCK "VarFileInfo"

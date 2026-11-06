@@ -2,20 +2,21 @@
 #define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
-#include <objbase.h>
 #include <process.h>
 #include <utility>
 #include <atomic>
+#include <cstddef>
 #include <cwchar>
 #include <iterator>
+#include <mutex>
 #include <string>
-#include <vector>
 #include "resource.h"
 #include "GsyncCore.h"
 #include "TrayMenu.h"
 
 using gsync::Mode;
 using gsync::State;
+using gsync::WindowsError;
 
 constexpr UINT WMAPP_TRAYICON = WM_APP + 1;
 constexpr UINT WMAPP_CHANGED = WM_APP + 2;
@@ -23,42 +24,75 @@ constexpr UINT WMAPP_COMMANDDONE = WM_APP + 3;
 constexpr UINT WMAPP_SHOWMENU = WM_APP + 4;
 constexpr UINT WMAPP_SHOWERROR = WM_APP + 5;
 constexpr UINT_PTR TrayRetryTimer = 1;
+constexpr UINT TrayRetryInterval = 1000;
+constexpr unsigned TrayRetryLimit = 10;
+constexpr DWORD WatchRetryFirst = 500;
+constexpr DWORD WatchRetryMax = 10000;
+constexpr DWORD SettleWait = 250;
 constexpr ULONGLONG ClickDelay = 5000;
 constexpr wchar_t InstanceName[] = L"Local\\GsyncStatusTrayToggle.Instance";
 constexpr wchar_t WindowClass[] = L"GsyncStatusTrayToggleClass";
 constexpr wchar_t AppName[] = L"GsyncStatusTrayToggle";
-constexpr wchar_t DriverKey[] = L"SYSTEM\\CurrentControlSet\\Services\\nvlddmkm\\State";
-constexpr wchar_t DriverValue[] = L"0x1194f158";
+constexpr wchar_t DriverSettingsFolder[] = L"%ProgramData%\\NVIDIA Corporation\\Drs";
 constexpr wchar_t SettingsKey[] = L"Software\\GsyncStatusTrayToggle";
 constexpr wchar_t SettingsValue[] = L"ToggleMode";
 constexpr wchar_t StartupKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t StartupApprovedKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
 constexpr DWORD StartupCommandLimit = 260;
+constexpr wchar_t InternalErrorText[] = L"GsyncStatusTrayToggle stopped after an internal error. Start it again.";
 
-class Handle {
+enum Icon : std::size_t
+{
+    IconOff,
+    IconFullscreen,
+    IconWindowed,
+    IconUnknown,
+    IconOffLight,
+    IconUnknownLight,
+    IconCount
+};
+
+constexpr int IconResources[IconCount] = {IDI_ICON_OFF,     IDI_ICON_FULLSCREEN, IDI_ICON_WINDOWED,
+                                          IDI_ICON_UNKNOWN, IDI_ICON_OFF_LIGHT,  IDI_ICON_UNKNOWN_LIGHT};
+
+class Handle
+{
 public:
     HANDLE value = nullptr;
     Handle() = default;
-    explicit Handle(HANDLE h) : value(h) {}
+    explicit Handle(HANDLE h) : value(h)
+    {
+    }
     Handle(const Handle&) = delete;
     Handle& operator=(const Handle&) = delete;
-    ~Handle() { Reset(); }
-    explicit operator bool() const { return value != nullptr; }
+    ~Handle()
+    {
+        Reset();
+    }
+    explicit operator bool() const
+    {
+        return value != nullptr;
+    }
 
-    void Reset(HANDLE h = nullptr) {
-        if (*this) CloseHandle(value);
+    void Reset(HANDLE h = nullptr)
+    {
+        if (*this)
+            CloseHandle(value);
         value = h;
     }
 };
 
-struct RegKey {
-    HKEY value = nullptr;
-    ~RegKey() { Reset(); }
-
-    void Reset() {
-        if (value) RegCloseKey(value);
-        value = nullptr;
+struct MenuHandle
+{
+    HMENU value = nullptr;
+    MenuHandle() = default;
+    MenuHandle(const MenuHandle&) = delete;
+    MenuHandle& operator=(const MenuHandle&) = delete;
+    ~MenuHandle()
+    {
+        if (value)
+            DestroyMenu(value);
     }
 };
 
@@ -71,7 +105,7 @@ static std::wstring g_pendingError;
 
 static UINT g_taskbarCreated = 0;
 static NOTIFYICONDATAW g_nid{};
-static HICON g_icons[6]{};
+static HICON g_icons[IconCount]{};
 static bool g_lightTaskbar = false;
 static bool g_iconAdded = false;
 static bool g_trayRetryActive = false;
@@ -80,14 +114,16 @@ static unsigned g_trayRetries = 0;
 static Mode g_preference = Mode::Fullscreen;
 static bool g_preferenceErrorShown = false;
 
-static RegKey g_driverKey;
+// NVAPI does not document thread safety, so the tray calls it from one thread at a time.
+static std::mutex g_nvapi;
+static std::atomic<State> g_profileState{State::Unknown};
 static Handle g_watchStop;
-static Handle g_watchRegistry;
+static Handle g_readRequest;
 static Handle g_watchThread;
 static std::atomic<bool> g_refreshQueued{false};
-static std::atomic<DWORD> g_watchError{ERROR_SUCCESS};
 
-struct CommandJob {
+struct CommandJob
+{
     gsync::Action action = gsync::Action::Invalid;
     Mode preference = Mode::Fullscreen;
     gsync::Result result;
@@ -110,92 +146,100 @@ static bool g_menuRefresh = false;
 static void RefreshTray();
 static void UpdateMenuChecks();
 
-static std::wstring WindowsError(const wchar_t* action, DWORD code) {
-    std::wstring message(action);
-    message += L"\n\n";
-    wchar_t* detail = nullptr;
-    if (FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                       nullptr, code, 0, reinterpret_cast<LPWSTR>(&detail), 0, nullptr) &&
-        detail) {
-        message += detail;
-        LocalFree(detail);
-        message.erase(message.find_last_not_of(L" \r\n") + 1);
-    }
-    message += L" (code " + std::to_wstring(code) + L")";
-    return message;
-}
-
-static void ShowError(const std::wstring& text) {
-    if (text.empty() || g_stopping) return;
-    if (g_errorDialog || g_activeMenu) {
-        if (g_pendingError.empty()) g_pendingError = text;
+static void ShowError(const std::wstring& text)
+{
+    if (text.empty() || g_stopping)
+        return;
+    if (g_errorDialog || g_activeMenu)
+    {
+        if (g_pendingError.empty())
+            g_pendingError = text;
         return;
     }
     g_errorDialog = true;
     MessageBoxW(g_hwnd, text.c_str(), AppName, MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
     g_errorDialog = false;
-    if (g_exitRequested) {
-        PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+    if (g_exitRequested)
+    {
+        static_cast<void>(PostMessageW(g_hwnd, WM_CLOSE, 0, 0));
         return;
     }
-    if (!g_pendingError.empty()) ShowError(std::exchange(g_pendingError, {}));
+    if (!g_pendingError.empty())
+        ShowError(std::exchange(g_pendingError, {}));
 }
 
-static bool ReadSavedMode(Mode& mode) {
+static bool ReadSavedMode(Mode& mode)
+{
     wchar_t text[32]{};
     DWORD size = sizeof(text);
     const LSTATUS rc = RegGetValueW(HKEY_CURRENT_USER, SettingsKey, SettingsValue, RRF_RT_REG_SZ, nullptr, text, &size);
-    if (rc != ERROR_SUCCESS) return false;
+    if (rc != ERROR_SUCCESS)
+        return false;
     return gsync::ParseMode(text, mode);
 }
 
-static bool SaveMode(Mode mode, std::wstring& error) {
+static bool SaveMode(Mode mode, std::wstring& error)
+{
     const wchar_t* text = gsync::ModeName(mode);
     const LSTATUS rc = RegSetKeyValueW(HKEY_CURRENT_USER, SettingsKey, SettingsValue, REG_SZ, text,
                                        static_cast<DWORD>((std::wcslen(text) + 1) * sizeof(wchar_t)));
-    if (rc == ERROR_SUCCESS) return true;
-    error = WindowsError(L"Unable to save the preferred mode in the registry.", static_cast<DWORD>(rc));
+    if (rc == ERROR_SUCCESS)
+        return true;
+    error = WindowsError(L"The preferred mode could not be saved in the registry.", static_cast<DWORD>(rc));
     return false;
 }
 
-static void ReportPreferenceError(const std::wstring& error) {
-    if (g_preferenceErrorShown) return;
+static void ReportPreferenceError(const std::wstring& error)
+{
+    if (g_preferenceErrorShown)
+        return;
     g_preferenceErrorShown = true;
     ShowError(error + L"\n\nThe selected mode stays in use until the tray is closed.");
 }
 
-static void SetPreference(Mode mode) {
-    if (mode == g_preference) return;
+static void SetPreference(Mode mode)
+{
+    if (mode == g_preference)
+        return;
     g_preference = mode;
     UpdateMenuChecks();
     std::wstring error;
-    if (!SaveMode(mode, error)) ReportPreferenceError(error);
+    if (!SaveMode(mode, error))
+        ReportPreferenceError(error);
 }
 
-static void ObserveActiveMode(State state) {
-    if (gsync::IsOn(state)) SetPreference(gsync::StateMode(state));
+static void ObserveActiveMode(State state)
+{
+    if (gsync::IsOn(state))
+        SetPreference(gsync::StateMode(state));
 }
 
-static bool StartupDisabledByWindows() {
+static bool StartupDisabledByWindows()
+{
     BYTE data[64]{};
     DWORD size = sizeof(data);
     const LSTATUS rc =
         RegGetValueW(HKEY_CURRENT_USER, StartupApprovedKey, AppName, RRF_RT_REG_BINARY, nullptr, data, &size);
-    if (rc != ERROR_SUCCESS) return false;
+    if (rc != ERROR_SUCCESS)
+        return false;
+    // Task Manager marks a disabled entry with an odd first byte.
     return size >= 1 && (data[0] == 0x03 || data[0] == 0x07);
 }
 
-struct StartupState {
+struct StartupState
+{
     bool known = false;
     bool enabled = false;
     std::wstring command;
 };
 
-static StartupState ReadStartup() {
+static StartupState ReadStartup()
+{
     StartupState startup;
     wchar_t path[StartupCommandLimit + 1]{};
     const DWORD length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
-    if (!length || length > StartupCommandLimit - 2) return startup;
+    if (!length || length > StartupCommandLimit - 2)
+        return startup;
     startup.command = L"\"" + std::wstring(path, length) + L"\"";
     const std::wstring& command = startup.command;
 
@@ -203,11 +247,13 @@ static StartupState ReadStartup() {
     DWORD size = sizeof(stored);
     const LSTATUS rc = RegGetValueW(HKEY_CURRENT_USER, StartupKey, AppName, RRF_RT_REG_SZ, nullptr, stored, &size);
     if (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND || rc == ERROR_MORE_DATA ||
-        rc == ERROR_UNSUPPORTED_TYPE || rc == ERROR_INVALID_DATA) {
+        rc == ERROR_UNSUPPORTED_TYPE || rc == ERROR_INVALID_DATA)
+    {
         startup.known = true;
         return startup;
     }
-    if (rc != ERROR_SUCCESS) return startup;
+    if (rc != ERROR_SUCCESS)
+        return startup;
 
     const bool registered = size == (command.size() + 1) * sizeof(wchar_t) &&
                             CompareStringOrdinal(stored, static_cast<int>(command.size()), command.c_str(),
@@ -217,139 +263,324 @@ static StartupState ReadStartup() {
     return startup;
 }
 
-static void ToggleStartup() {
-    if (g_stopping || g_errorDialog) return;
+static void ToggleStartup()
+{
+    if (g_stopping || g_errorDialog)
+        return;
     const StartupState startup = ReadStartup();
-    if (!startup.known) return;
+    if (!startup.known)
+        return;
     const std::wstring& command = startup.command;
     LSTATUS rc = startup.enabled ? RegDeleteKeyValueW(HKEY_CURRENT_USER, StartupKey, AppName)
                                  : RegSetKeyValueW(HKEY_CURRENT_USER, StartupKey, AppName, REG_SZ, command.c_str(),
                                                    static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
-    if (startup.enabled && (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND)) rc = ERROR_SUCCESS;
-    if (rc != ERROR_SUCCESS) {
-        ShowError(
-            WindowsError(L"Unable to change the Windows startup entry of the application.", static_cast<DWORD>(rc)));
+    if (startup.enabled && (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND))
+        rc = ERROR_SUCCESS;
+    if (rc != ERROR_SUCCESS)
+    {
+        ShowError(WindowsError(L"The Windows startup entry could not be changed.", static_cast<DWORD>(rc)));
         return;
     }
-    RegDeleteKeyValueW(HKEY_CURRENT_USER, StartupApprovedKey, AppName);
+    // Task Manager disables a Run entry through StartupApproved. A choice made in the menu clears that flag.
+    static_cast<void>(RegDeleteKeyValueW(HKEY_CURRENT_USER, StartupApprovedKey, AppName));
 }
 
-static State ReadDriverState() {
-    for (int attempt = 0; attempt != 2; ++attempt) {
-        if (!g_driverKey.value) {
-            const LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, DriverKey, 0, KEY_QUERY_VALUE, &g_driverKey.value);
-            if (rc != ERROR_SUCCESS) return State::Unknown;
+static void QueueRefresh()
+{
+    if (g_stopping || g_refreshQueued.exchange(true))
+        return;
+    if (!PostMessageW(g_hwnd, WMAPP_CHANGED, 0, 0))
+        g_refreshQueued = false;
+}
+
+static void RequestState()
+{
+    if (g_readRequest)
+        static_cast<void>(SetEvent(g_readRequest.value));
+}
+
+static void PublishState()
+{
+    State state = State::Unknown;
+    {
+        const std::lock_guard<std::mutex> guard(g_nvapi);
+        state = gsync::ReadState();
+    }
+    g_profileState = state;
+    QueueRefresh();
+}
+
+static DWORD NextRetry(DWORD ms)
+{
+    return ms >= WatchRetryMax / 2 ? WatchRetryMax : ms * 2;
+}
+
+class NvapiReference
+{
+    bool loaded_ = false;
+
+public:
+    NvapiReference()
+    {
+        const std::lock_guard<std::mutex> guard(g_nvapi);
+        loaded_ = NvAPI_Initialize() == NVAPI_OK;
+    }
+    NvapiReference(const NvapiReference&) = delete;
+    NvapiReference& operator=(const NvapiReference&) = delete;
+    ~NvapiReference()
+    {
+        if (!loaded_)
+            return;
+        const std::lock_guard<std::mutex> guard(g_nvapi);
+        NvAPI_Unload();
+    }
+};
+
+class SettingsWatch
+{
+    Handle folder_;
+    Handle event_;
+    OVERLAPPED overlapped_{};
+    bool armed_ = false;
+    DWORD buffer_[1024]{};
+
+public:
+    SettingsWatch() = default;
+    SettingsWatch(const SettingsWatch&) = delete;
+    SettingsWatch& operator=(const SettingsWatch&) = delete;
+
+    ~SettingsWatch()
+    {
+        if (!armed_)
+            return;
+        // Windows writes into buffer_ until the request ends, so the cancellation must complete first.
+        DWORD bytes = 0;
+        static_cast<void>(CancelIoEx(folder_.value, &overlapped_));
+        static_cast<void>(GetOverlappedResult(folder_.value, &overlapped_, &bytes, TRUE));
+    }
+
+    HANDLE Event() const
+    {
+        return event_.value;
+    }
+
+    bool Start(const wchar_t* folder)
+    {
+        event_.Reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        const HANDLE handle =
+            CreateFileW(folder, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+            return false;
+        folder_.Reset(handle);
+        return event_ && Arm();
+    }
+
+    bool Arm()
+    {
+        overlapped_ = {};
+        overlapped_.hEvent = event_.value;
+        if (!ResetEvent(event_.value) || !ReadDirectoryChangesW(folder_.value, buffer_, sizeof(buffer_), FALSE,
+                                                                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE |
+                                                                    FILE_NOTIFY_CHANGE_LAST_WRITE,
+                                                                nullptr, &overlapped_, nullptr))
+            return false;
+        armed_ = true;
+        return true;
+    }
+
+    bool Collect(bool& changed)
+    {
+        DWORD bytes = 0;
+        const bool done = GetOverlappedResult(folder_.value, &overlapped_, &bytes, FALSE) != FALSE;
+        const DWORD error = done ? ERROR_SUCCESS : GetLastError();
+        if (error == ERROR_IO_INCOMPLETE)
+            return false;
+        armed_ = false;
+        // When too many changes arrive at once, Windows drops the names, so assume the settings changed.
+        if (error == ERROR_NOTIFY_ENUM_DIR || (done && bytes == 0))
+        {
+            changed = true;
+            return true;
         }
-        DWORD value = 0, type = 0, size = sizeof(value);
-        const LSTATUS rc =
-            RegQueryValueExW(g_driverKey.value, DriverValue, nullptr, &type, reinterpret_cast<LPBYTE>(&value), &size);
-        if ((rc == ERROR_KEY_DELETED || rc == ERROR_INVALID_HANDLE) && attempt == 0) {
-            g_driverKey.Reset();
+        if (!done)
+            return false;
+        for (DWORD offset = 0; offset < bytes;)
+        {
+            const BYTE* record = reinterpret_cast<const BYTE*>(buffer_) + offset;
+            const auto* entry = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(record);
+            const auto* name = reinterpret_cast<const wchar_t*>(record + offsetof(FILE_NOTIFY_INFORMATION, FileName));
+            changed = changed || gsync::IsDriverSettingsFile({name, entry->FileNameLength / sizeof(wchar_t)});
+            if (!entry->NextEntryOffset)
+                break;
+            offset += entry->NextEntryOffset;
+        }
+        return true;
+    }
+};
+
+// NVIDIA saves its settings in these files whichever program makes the change, and watching them needs no
+// administrator rights, unlike the driver's registry key. One save rewrites three files, so the profile is read
+// once they are quiet.
+static bool FollowSettings(SettingsWatch& watch)
+{
+    const HANDLE waits[] = {g_watchStop.value, g_readRequest.value, watch.Event()};
+    bool pending = false;
+    for (;;)
+    {
+        const DWORD wait = WaitForMultipleObjects(3, waits, FALSE, pending ? SettleWait : INFINITE);
+        if (wait == WAIT_OBJECT_0)
+            return true;
+        if (wait == WAIT_OBJECT_0 + 1 || wait == WAIT_TIMEOUT)
+        {
+            pending = false;
+            PublishState();
             continue;
         }
-        if (rc == ERROR_FILE_NOT_FOUND) return gsync::DecodeState(gsync::SettingDefaults[gsync::ApplicationMode]);
-        if (rc != ERROR_SUCCESS || type != REG_DWORD || size != sizeof(value)) return State::Unknown;
-        return gsync::DecodeState(value);
+        bool changed = false;
+        if (wait != WAIT_OBJECT_0 + 2 || !watch.Collect(changed) || !watch.Arm())
+            return false;
+        pending = pending || changed;
     }
-    return State::Unknown;
 }
 
-static void QueueRefresh() {
-    if (g_stopping || g_refreshQueued.exchange(true)) return;
-    if (!PostMessageW(g_hwnd, WMAPP_CHANGED, 0, 0)) g_refreshQueued = false;
+static void WatchSettings()
+{
+    wchar_t folder[MAX_PATH]{};
+    const DWORD length = ExpandEnvironmentStringsW(DriverSettingsFolder, folder, MAX_PATH);
+    const bool known = length && length <= MAX_PATH;
+    DWORD retry = WatchRetryFirst;
+    bool publish = true;
+    for (;;)
+    {
+        SettingsWatch watch;
+        const bool started = known && watch.Start(folder);
+        if (started || publish)
+            PublishState();
+        publish = false;
+        if (started)
+        {
+            retry = WatchRetryFirst;
+            if (FollowSettings(watch))
+                return;
+        }
+        const HANDLE waits[] = {g_watchStop.value, g_readRequest.value};
+        const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, retry);
+        if (wait == WAIT_TIMEOUT)
+            retry = NextRetry(retry);
+        else if (wait == WAIT_OBJECT_0 + 1)
+            publish = true;
+        else
+            return;
+    }
 }
 
-static DWORD NextRetry(DWORD ms) {
-    return ms >= 5000 ? 10000 : ms * 2;
-}
-
-static DWORD WINAPI WatchThreadProc(LPVOID) {
-    RegKey key;
-    DWORD retry = 500;
-    HANDLE waits[] = {g_watchStop.value, g_watchRegistry.value};
-    for (;;) {
-        LSTATUS rc = ERROR_SUCCESS;
-        if (!key.value) rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, DriverKey, 0, KEY_NOTIFY, &key.value);
-        if (rc == ERROR_SUCCESS)
-            rc = RegNotifyChangeKeyValue(key.value, FALSE, REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME,
-                                         g_watchRegistry.value, TRUE);
-        g_watchError = static_cast<DWORD>(rc);
+static unsigned __stdcall WatchThreadProc(void*) noexcept
+{
+    try
+    {
+        // One NVAPI reference for the life of the tray keeps nvapi64.dll loaded, so a read does not load and
+        // verify the DLL again.
+        const NvapiReference nvapi;
+        WatchSettings();
+    }
+    catch (...)
+    {
+        g_profileState = State::Unknown;
         QueueRefresh();
-        if (rc == ERROR_SUCCESS) {
-            if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
-            retry = 500;
-            continue;
-        }
-        key.Reset();
-        if (WaitForSingleObject(g_watchStop.value, retry) != WAIT_TIMEOUT) break;
-        retry = NextRetry(retry);
     }
     return 0;
 }
 
-static unsigned __stdcall CommandThreadProc(void*) {
-    try {
+static unsigned __stdcall CommandThreadProc(void*) noexcept
+{
+    try
+    {
+        const std::lock_guard<std::mutex> guard(g_nvapi);
         g_command.result = gsync::Execute(g_command.action, g_command.preference);
-    } catch (...) {
-        g_command.result = gsync::Failure(gsync::ExitCode::InternalError, L"The G-SYNC command hit an internal error.");
     }
-    while (!g_stopping && !PostMessageW(g_hwnd, WMAPP_COMMANDDONE, 0, 0)) Sleep(50);
+    catch (...)
+    {
+        g_command.result = {};
+        g_command.result.code = gsync::ExitCode::InternalError;
+    }
+    while (!g_stopping && !PostMessageW(g_hwnd, WMAPP_COMMANDDONE, 0, 0))
+        Sleep(gsync::PollWait);
     return 0;
 }
 
-static void FinishCommand() {
-    WaitForSingleObject(g_commandThread.value, INFINITE);
+static void FinishCommand()
+{
+    static_cast<void>(WaitForSingleObject(g_commandThread.value, INFINITE));
     g_commandThread.Reset();
     g_busy = false;
 
     gsync::Result result = std::move(g_command.result);
-    if (result.code == gsync::ExitCode::Success && result.hasRemembered) SetPreference(result.remembered);
+    if (result.code == gsync::ExitCode::InternalError && result.error.empty())
+        result.error = L"The G-SYNC command hit an internal error. Check the state before toggling again.";
+    if (result.state != State::Unknown)
+        g_profileState = result.state;
+    RequestState();
+    if (result.code == gsync::ExitCode::Success && result.hasRemembered)
+        SetPreference(result.remembered);
     UpdateMenuChecks();
     RefreshTray();
     ShowError(result.error);
-    if (g_exitRequested) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+    if (g_exitRequested)
+        static_cast<void>(PostMessageW(g_hwnd, WM_CLOSE, 0, 0));
 }
 
-static void StartCommand(gsync::Action action) {
-    if (g_busy || g_errorDialog || g_stopping || g_exitRequested) return;
+static void StartCommand(gsync::Action action)
+{
+    if (g_busy || g_errorDialog || g_stopping || g_exitRequested)
+        return;
     g_command.action = action;
     g_command.preference = g_preference;
     g_command.result = {};
     g_busy = true;
     UpdateMenuChecks();
 
+    SetLastError(ERROR_SUCCESS);
     g_commandThread.Reset(reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, CommandThreadProc, nullptr, 0, nullptr)));
-    if (!g_commandThread) {
+    if (!g_commandThread)
+    {
         g_busy = false;
         UpdateMenuChecks();
-        ShowError(L"Unable to start the G-SYNC command: not enough resources.");
+        ShowError(WindowsError(L"The G-SYNC command could not be started.", GetLastError()));
     }
 }
 
-static void RunToggle() {
-    if (g_busy || g_errorDialog || g_stopping) return;
+static void RunToggle()
+{
+    if (g_busy || g_errorDialog || g_stopping)
+        return;
     const ULONGLONG now = GetTickCount64();
-    if (g_lastClick && now - g_lastClick < ClickDelay) return;
+    if (g_lastClick && now - g_lastClick < ClickDelay)
+        return;
     g_lastClick = now;
     StartCommand(gsync::Action::Toggle);
 }
 
-static HICON StateIcon(State state) {
-    switch (state) {
+static HICON StateIcon(State state)
+{
+    switch (state)
+    {
     case State::Off:
-        return g_icons[g_lightTaskbar ? 4 : 0];
+        return g_icons[g_lightTaskbar ? IconOffLight : IconOff];
     case State::Fullscreen:
-        return g_icons[1];
+        return g_icons[IconFullscreen];
     case State::Windowed:
-        return g_icons[2];
+        return g_icons[IconWindowed];
     default:
-        return g_icons[g_lightTaskbar ? 5 : 3];
+        return g_icons[g_lightTaskbar ? IconUnknownLight : IconUnknown];
     }
 }
 
-static void SetTrayState(State state) {
+static void SetTrayState(State state)
+{
     const wchar_t* tip = L"G-SYNC Unknown";
-    switch (state) {
+    switch (state)
+    {
     case State::Off:
         tip = L"G-SYNC Off";
         break;
@@ -364,30 +595,39 @@ static void SetTrayState(State state) {
     }
     g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     g_nid.hIcon = StateIcon(state);
-    lstrcpynW(g_nid.szTip, tip, static_cast<int>(std::size(g_nid.szTip)));
+    if (!lstrcpynW(g_nid.szTip, tip, static_cast<int>(std::size(g_nid.szTip))))
+        g_nid.szTip[0] = L'\0';
 }
 
-static void StopTrayRetry() {
-    if (g_trayRetryActive) KillTimer(g_hwnd, TrayRetryTimer);
+static void StopTrayRetry()
+{
+    if (g_trayRetryActive)
+        static_cast<void>(KillTimer(g_hwnd, TrayRetryTimer));
     g_trayRetryActive = false;
     g_trayRetries = 0;
 }
 
-static void ScheduleTrayRetry() {
-    if (g_trayRetryActive || g_stopping) return;
-    if (!SetTimer(g_hwnd, TrayRetryTimer, 1000, nullptr)) {
-        ShowError(WindowsError(L"Unable to schedule the tray icon restore.", GetLastError()));
+static void ScheduleTrayRetry()
+{
+    if (g_trayRetryActive || g_stopping)
+        return;
+    if (!SetTimer(g_hwnd, TrayRetryTimer, TrayRetryInterval, nullptr))
+    {
+        ShowError(WindowsError(L"The tray icon restore could not be scheduled.", GetLastError()));
         return;
     }
     g_trayRetryActive = true;
 }
 
-static bool AddTrayIcon(State state) {
+static bool AddTrayIcon(State state)
+{
     SetTrayState(state);
-    if (!Shell_NotifyIconW(NIM_ADD, &g_nid) && !Shell_NotifyIconW(NIM_MODIFY, &g_nid)) return false;
+    if (!Shell_NotifyIconW(NIM_ADD, &g_nid) && !Shell_NotifyIconW(NIM_MODIFY, &g_nid))
+        return false;
     g_nid.uVersion = NOTIFYICON_VERSION_4;
-    if (!Shell_NotifyIconW(NIM_SETVERSION, &g_nid)) {
-        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    if (!Shell_NotifyIconW(NIM_SETVERSION, &g_nid))
+    {
+        static_cast<void>(Shell_NotifyIconW(NIM_DELETE, &g_nid));
         return false;
     }
     g_iconAdded = true;
@@ -395,47 +635,63 @@ static bool AddTrayIcon(State state) {
     return true;
 }
 
-static void RefreshTray() {
-    if (g_stopping) return;
-    const State state = g_watchError.load() == ERROR_SUCCESS ? ReadDriverState() : State::Unknown;
-    if (!g_iconAdded) {
-        if (!AddTrayIcon(state)) ScheduleTrayRetry();
-    } else if (StateIcon(state) != g_nid.hIcon) {
+static void RefreshTray()
+{
+    if (g_stopping)
+        return;
+    const State state = g_profileState.load();
+    if (!g_iconAdded)
+    {
+        if (!AddTrayIcon(state))
+            ScheduleTrayRetry();
+    }
+    else if (StateIcon(state) != g_nid.hIcon)
+    {
         SetTrayState(state);
-        if (!Shell_NotifyIconW(NIM_MODIFY, &g_nid)) {
-            Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        if (!Shell_NotifyIconW(NIM_MODIFY, &g_nid))
+        {
+            static_cast<void>(Shell_NotifyIconW(NIM_DELETE, &g_nid));
             g_iconAdded = false;
-            if (!AddTrayIcon(state)) ScheduleTrayRetry();
+            if (!AddTrayIcon(state))
+                ScheduleTrayRetry();
         }
     }
 
-    if (!g_busy) ObserveActiveMode(state);
+    if (!g_busy)
+        ObserveActiveMode(state);
 }
 
-static void RemoveTrayIcon() {
+static void RemoveTrayIcon()
+{
     StopTrayRetry();
-    if (g_iconAdded) Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    if (g_iconAdded)
+        static_cast<void>(Shell_NotifyIconW(NIM_DELETE, &g_nid));
     g_iconAdded = false;
 }
 
-static void UpdateMenuChecks() {
-    if (!g_activeMenu) return;
+static void UpdateMenuChecks()
+{
+    if (!g_activeMenu)
+        return;
     const UINT selected = g_preference == Mode::Fullscreen ? ID_TRAY_FULLSCREEN : ID_TRAY_WINDOWED;
-    for (const UINT id : {static_cast<UINT>(ID_TRAY_FULLSCREEN), static_cast<UINT>(ID_TRAY_WINDOWED)}) {
+    for (const UINT id : {static_cast<UINT>(ID_TRAY_FULLSCREEN), static_cast<UINT>(ID_TRAY_WINDOWED)})
+    {
         MENUITEMINFOW item{};
         item.cbSize = sizeof(item);
         item.fMask = MIIM_STATE;
         item.fState =
             static_cast<UINT>((id == selected ? MFS_CHECKED : MFS_UNCHECKED) | (g_busy ? MFS_GRAYED : MFS_ENABLED));
         const UINT previous = GetMenuState(g_activeMenu, id, MF_BYCOMMAND);
-        if (previous != static_cast<UINT>(-1)) item.fState |= previous & MFS_HILITE;
-        SetMenuItemInfoW(g_activeMenu, id, FALSE, &item);
+        if (previous != static_cast<UINT>(-1))
+            item.fState |= previous & MFS_HILITE;
+        static_cast<void>(SetMenuItemInfoW(g_activeMenu, id, FALSE, &item));
     }
 }
 
-static void DispatchMenuCommand(UINT command) {
+static void DispatchMenuCommand(UINT command)
+{
     if (command == ID_TRAY_EXIT)
-        PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+        static_cast<void>(PostMessageW(g_hwnd, WM_CLOSE, 0, 0));
     else if (command == ID_TRAY_FULLSCREEN)
         StartCommand(gsync::Action::SelectFullscreen);
     else if (command == ID_TRAY_WINDOWED)
@@ -444,8 +700,10 @@ static void DispatchMenuCommand(UINT command) {
         ToggleStartup();
 }
 
-static bool IsRightButtonMessage(UINT message) {
-    switch (message) {
+static bool IsRightButtonMessage(UINT message)
+{
+    switch (message)
+    {
     case WM_RBUTTONDOWN:
     case WM_RBUTTONUP:
     case WM_RBUTTONDBLCLK:
@@ -458,16 +716,24 @@ static bool IsRightButtonMessage(UINT message) {
     }
 }
 
-static LRESULT CALLBACK MenuFilterProc(int code, WPARAM wParam, LPARAM lParam) {
-    if (code == MSGF_MENU && g_menuVisual) {
+// While the menu is open, it owns the input and the shell reports nothing for the icon. This hook catches a
+// right-click on the icon so the menu reopens with the current state.
+static LRESULT CALLBACK MenuFilterProc(int code, WPARAM wParam, LPARAM lParam) noexcept
+{
+    if (code == MSGF_MENU && g_menuVisual)
+    {
         const MSG& msg = *reinterpret_cast<const MSG*>(lParam);
-        if (IsRightButtonMessage(msg.message)) {
-            if (g_menuVisual->Contains(msg.pt)) return TRUE;
-            if (PtInRect(&g_menuIcon, msg.pt)) {
+        if (IsRightButtonMessage(msg.message))
+        {
+            if (g_menuVisual->Contains(msg.pt))
+                return TRUE;
+            if (PtInRect(&g_menuIcon, msg.pt))
+            {
                 const bool pressed = msg.message != WM_RBUTTONUP && msg.message != WM_NCRBUTTONUP;
-                if (pressed && !g_menuRefresh) {
+                if (pressed && !g_menuRefresh)
+                {
                     g_menuRefresh = true;
-                    EndMenu();
+                    static_cast<void>(EndMenu());
                 }
                 return TRUE;
             }
@@ -476,26 +742,34 @@ static LRESULT CALLBACK MenuFilterProc(int code, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
-static void ShowTrayMenu(const POINT* shellAnchor) {
-    if (g_errorDialog || g_activeMenu || g_stopping) return;
+static void ShowTrayMenu(const POINT* shellAnchor)
+{
+    if (g_errorDialog || g_activeMenu || g_stopping)
+        return;
 
     traymenu::Placement placement;
-    if (!traymenu::Locate(g_hwnd, g_nid.uID, shellAnchor, placement)) return;
+    if (!traymenu::Locate(g_hwnd, g_nid.uID, shellAnchor, placement))
+        return;
     g_menuIcon = placement.icon;
+    // The hidden owner moves to the icon so the menu gets the DPI of that monitor.
     if (!SetWindowPos(g_hwnd, nullptr, placement.point.x, placement.point.y, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE))
         return;
+    RequestState();
     RefreshTray();
-    if (g_stopping || g_exitRequested) return;
+    if (g_stopping || g_exitRequested)
+        return;
 
-    HMENU menu = CreatePopupMenu();
-    if (!menu) {
-        ShowError(WindowsError(L"Unable to open the menu.", GetLastError()));
+    traymenu::Visual visual;
+    MenuHandle menu;
+    menu.value = CreatePopupMenu();
+    if (!menu.value)
+    {
+        ShowError(WindowsError(L"The menu could not be opened.", GetLastError()));
         return;
     }
-    traymenu::Visual visual;
-    if (!visual.Prepare(g_hwnd, traymenu::MonitorDpi(placement.point), menu, g_menuItems, std::size(g_menuItems))) {
-        DestroyMenu(menu);
-        ShowError(L"Unable to prepare the menu.");
+    if (!visual.Prepare(g_hwnd, traymenu::MonitorDpi(placement.point), menu.value, g_menuItems, std::size(g_menuItems)))
+    {
+        ShowError(WindowsError(L"The menu could not be prepared.", visual.Error()));
         return;
     }
 
@@ -505,28 +779,33 @@ static void ShowTrayMenu(const POINT* shellAnchor) {
     startupItem.fMask = MIIM_STATE;
     startupItem.fState =
         static_cast<UINT>((startup.enabled ? MFS_CHECKED : MFS_UNCHECKED) | (startup.known ? MFS_ENABLED : MFS_GRAYED));
-    if (!SetMenuItemInfoW(menu, ID_TRAY_STARTUP, FALSE, &startupItem)) {
-        const DWORD code = GetLastError();
-        DestroyMenu(menu);
-        ShowError(WindowsError(L"Unable to prepare the Start with Windows option.", code));
+    if (!SetMenuItemInfoW(menu.value, ID_TRAY_STARTUP, FALSE, &startupItem))
+    {
+        ShowError(WindowsError(L"The Start with Windows option could not be prepared.", GetLastError()));
         return;
     }
 
-    g_activeMenu = menu;
+    g_activeMenu = menu.value;
     g_menuVisual = &visual;
     UpdateMenuChecks();
 
     BOOL shown = FALSE;
+    DWORD menuError = ERROR_SUCCESS;
     bool activated = false;
     {
         traymenu::OwnerScope owner(g_hwnd);
+        // Without a foreground owner, the menu does not close when the user clicks elsewhere.
         activated = owner.Activate();
-        if (activated) {
+        if (activated)
+        {
             g_menuRefresh = false;
             const HHOOK filter = SetWindowsHookExW(WH_MSGFILTER, MenuFilterProc, nullptr, GetCurrentThreadId());
-            shown = TrackPopupMenuEx(menu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, placement.point.x, placement.point.y,
+            shown = TrackPopupMenuEx(menu.value, TPM_BOTTOMALIGN | TPM_LEFTALIGN, placement.point.x, placement.point.y,
                                      g_hwnd, nullptr);
-            if (filter) UnhookWindowsHookEx(filter);
+            if (!shown)
+                menuError = GetLastError();
+            if (filter)
+                UnhookWindowsHookEx(filter);
         }
     }
 
@@ -534,83 +813,110 @@ static void ShowTrayMenu(const POINT* shellAnchor) {
     g_menuRefresh = false;
     g_menuVisual = nullptr;
     g_activeMenu = nullptr;
-    DestroyMenu(menu);
-    if (refresh) {
-        PostMessageW(g_hwnd, WMAPP_SHOWMENU, 0, 0);
+    if (refresh)
+    {
+        static_cast<void>(PostMessageW(g_hwnd, WMAPP_SHOWMENU, 0, 0));
         return;
     }
 
-    Shell_NotifyIconW(NIM_SETFOCUS, &g_nid);
-    PostMessageW(g_hwnd, WM_NULL, 0, 0);
-    if (activated && !shown) ShowError(L"Unable to show the menu.");
-    if (!g_pendingError.empty()) PostMessageW(g_hwnd, WMAPP_SHOWERROR, 0, 0);
+    static_cast<void>(Shell_NotifyIconW(NIM_SETFOCUS, &g_nid));
+    static_cast<void>(PostMessageW(g_hwnd, WM_NULL, 0, 0));
+    if (activated && !shown)
+        ShowError(WindowsError(L"The menu could not be shown.", menuError));
+    if (!g_pendingError.empty())
+        static_cast<void>(PostMessageW(g_hwnd, WMAPP_SHOWERROR, 0, 0));
 }
 
-static void Shutdown(HWND hwnd) {
+static void Shutdown(HWND hwnd)
+{
     g_stopping = true;
     RemoveTrayIcon();
     DestroyWindow(hwnd);
 }
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == g_taskbarCreated) {
+static LRESULT HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (msg == g_taskbarCreated)
+    {
         g_iconAdded = false;
         StopTrayRetry();
         RefreshTray();
         return 0;
     }
-    switch (msg) {
+    switch (msg)
+    {
     case WM_ENTERIDLE:
-        if (wParam == MSGF_MENU && g_menuVisual) {
+        if (wParam == MSGF_MENU && g_menuVisual)
+        {
             g_menuVisual->RoundCorners();
             return 0;
         }
         break;
     case WM_DPICHANGED:
-        if (g_activeMenu) EndMenu();
+        if (g_activeMenu)
+            static_cast<void>(EndMenu());
         return 0;
     case WM_SETTINGCHANGE:
-        if (traymenu::TaskbarIsLight() != g_lightTaskbar) {
+        if (traymenu::TaskbarIsLight() != g_lightTaskbar)
+        {
             g_lightTaskbar = !g_lightTaskbar;
-            if (g_iconAdded) RefreshTray();
+            if (g_iconAdded)
+                RefreshTray();
         }
         return 0;
-    case WM_MEASUREITEM: {
+    case WM_MEASUREITEM:
+    {
         auto* item = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
-        if (g_menuVisual && item->CtlType == ODT_MENU) {
+        if (g_menuVisual && item->CtlType == ODT_MENU)
+        {
             g_menuVisual->Measure(*item);
             return TRUE;
         }
         break;
     }
-    case WM_DRAWITEM: {
+    case WM_DRAWITEM:
+    {
         const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
-        if (g_menuVisual && item->CtlType == ODT_MENU) return g_menuVisual->Draw(*item) ? TRUE : FALSE;
+        if (g_menuVisual && item->CtlType == ODT_MENU)
+            return g_menuVisual->Draw(*item) ? TRUE : FALSE;
         break;
     }
-    case WM_MENUCHAR: {
-        if (!g_activeMenu || reinterpret_cast<HMENU>(lParam) != g_activeMenu) break;
+    case WM_MENUCHAR:
+    {
+        if (!g_activeMenu || reinterpret_cast<HMENU>(lParam) != g_activeMenu)
+            break;
         wchar_t key = static_cast<wchar_t>(LOWORD(wParam));
-        if (key >= L'a' && key <= L'z') key = static_cast<wchar_t>(key - L'a' + L'A');
+        if (key >= L'a' && key <= L'z')
+            key = static_cast<wchar_t>(key - L'a' + L'A');
         int first = -1, next = -1, current = -1, matches = 0;
         const int count = static_cast<int>(std::size(g_menuItems));
         for (int i = 0; i < count; ++i)
-            if (GetMenuState(g_activeMenu, g_menuItems[i].id, MF_BYCOMMAND) & MF_HILITE) current = i;
-        for (int i = 0; i < count; ++i) {
+            if (GetMenuState(g_activeMenu, g_menuItems[i].id, MF_BYCOMMAND) & MF_HILITE)
+                current = i;
+        for (int i = 0; i < count; ++i)
+        {
             const UINT state = GetMenuState(g_activeMenu, g_menuItems[i].id, MF_BYCOMMAND);
-            if ((state & (MF_GRAYED | MF_DISABLED)) || key != g_menuItems[i].text[0]) continue;
-            if (first < 0) first = i;
-            if (i > current && next < 0) next = i;
+            if ((state & (MF_GRAYED | MF_DISABLED)) || key != g_menuItems[i].text[0])
+                continue;
+            if (first < 0)
+                first = i;
+            if (i > current && next < 0)
+                next = i;
             ++matches;
         }
-        if (!matches) return MAKELRESULT(0, MNC_IGNORE);
+        if (!matches)
+            return MAKELRESULT(0, MNC_IGNORE);
         return MAKELRESULT(next < 0 ? first : next, matches == 1 ? MNC_EXECUTE : MNC_SELECT);
     }
-    case WMAPP_TRAYICON: {
+    case WMAPP_TRAYICON:
+    {
         const UINT event = LOWORD(lParam);
-        if (event == NIN_SELECT || event == NIN_KEYSELECT) {
+        if (event == NIN_SELECT || event == NIN_KEYSELECT)
+        {
             RunToggle();
-        } else if (event == WM_CONTEXTMENU) {
+        }
+        else if (event == WM_CONTEXTMENU)
+        {
             const POINT anchor{static_cast<short>(LOWORD(wParam)), static_cast<short>(HIWORD(wParam))};
             ShowTrayMenu(&anchor);
         }
@@ -621,13 +927,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         RefreshTray();
         return 0;
     case WM_TIMER:
-        if (wParam == TrayRetryTimer && g_trayRetryActive) {
+        if (wParam == TrayRetryTimer && g_trayRetryActive)
+        {
             ++g_trayRetries;
             RefreshTray();
-            if (g_trayRetryActive && g_trayRetries >= 10) {
+            if (g_trayRetryActive && g_trayRetries >= TrayRetryLimit)
+            {
                 StopTrayRetry();
-                ShowError(
-                    L"Unable to restore the tray icon. Restart GsyncStatusTrayToggle once the taskbar is available.");
+                ShowError(L"The tray icon could not be restored. "
+                          L"Restart GsyncStatusTrayToggle once the taskbar is available.");
             }
         }
         return 0;
@@ -644,9 +952,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         DispatchMenuCommand(LOWORD(wParam));
         return 0;
     case WM_ENDSESSION:
-        if (wParam && !g_stopping) {
+        if (wParam && !g_stopping)
+        {
             Shutdown(hwnd);
-            if (g_commandThread) WaitForSingleObject(g_commandThread.value, INFINITE);
+            // Stopping in the middle of a toggle would leave G-SYNC half changed.
+            if (g_commandThread)
+                static_cast<void>(WaitForSingleObject(g_commandThread.value, INFINITE));
         }
         return 0;
     case WM_CLOSE:
@@ -662,150 +973,109 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-static bool StartWatcher(std::wstring& error) {
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    try
+    {
+        return HandleMessage(hwnd, msg, wParam, lParam);
+    }
+    catch (...)
+    {
+        // No exception may cross the user32 frames that call the window procedure.
+        PostQuitMessage(static_cast<int>(gsync::ExitCode::InternalError));
+        return 0;
+    }
+}
+
+static bool StartWatcher(std::wstring& error)
+{
     g_watchStop.Reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    g_watchRegistry.Reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
-    if (!g_watchStop || !g_watchRegistry) {
-        error = WindowsError(L"Unable to prepare the change monitoring.", GetLastError());
+    g_readRequest.Reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+    if (!g_watchStop || !g_readRequest)
+    {
+        error = WindowsError(L"The change monitoring could not be prepared.", GetLastError());
         return false;
     }
-    g_watchThread.Reset(CreateThread(nullptr, 0, WatchThreadProc, nullptr, 0, nullptr));
-    if (!g_watchThread) {
-        error = WindowsError(L"Unable to start the change monitoring.", GetLastError());
+    SetLastError(ERROR_SUCCESS);
+    g_watchThread.Reset(reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, WatchThreadProc, nullptr, 0, nullptr)));
+    if (!g_watchThread)
+    {
+        error = WindowsError(L"The change monitoring could not be started.", GetLastError());
         return false;
     }
-    SetThreadPriority(g_watchThread.value, THREAD_PRIORITY_LOWEST);
+    static_cast<void>(SetThreadPriority(g_watchThread.value, THREAD_PRIORITY_LOWEST));
     return true;
 }
 
-static void Cleanup() {
+static void Cleanup(HINSTANCE instance)
+{
     g_stopping = true;
-    if (g_commandThread) WaitForSingleObject(g_commandThread.value, INFINITE);
-    if (g_watchStop) SetEvent(g_watchStop.value);
-    if (g_watchThread) WaitForSingleObject(g_watchThread.value, INFINITE);
-
+    if (g_commandThread)
+        static_cast<void>(WaitForSingleObject(g_commandThread.value, INFINITE));
+    const bool watcherStopped = !g_watchThread || (SetEvent(g_watchStop.value) &&
+                                                   WaitForSingleObject(g_watchThread.value, INFINITE) == WAIT_OBJECT_0);
     g_commandThread.Reset();
-    g_watchThread.Reset();
-    g_watchStop.Reset();
-    g_watchRegistry.Reset();
-    g_driverKey.Reset();
+    if (watcherStopped)
+    {
+        g_watchThread.Reset();
+        g_watchStop.Reset();
+        g_readRequest.Reset();
+    }
 
-    if (g_hwnd && IsWindow(g_hwnd)) {
+    if (g_hwnd && IsWindow(g_hwnd))
+    {
         RemoveTrayIcon();
         DestroyWindow(g_hwnd);
     }
     g_hwnd = nullptr;
+    UnregisterClassW(WindowClass, instance);
 
-    for (HICON& icon : g_icons) {
-        if (icon) DestroyIcon(icon);
+    for (HICON& icon : g_icons)
+    {
+        if (icon)
+            DestroyIcon(icon);
         icon = nullptr;
     }
     g_instance.Reset();
 }
 
-static bool RegistryNeedsAdmin() {
-    RegKey key;
-    const LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, DriverKey, 0, KEY_QUERY_VALUE | KEY_NOTIFY, &key.value);
-    return rc == ERROR_ACCESS_DENIED;
-}
-
-static bool ReadElevation(TOKEN_ELEVATION_TYPE& type, std::wstring& error) {
+static bool RunsElevated()
+{
     Handle token;
+    TOKEN_ELEVATION_TYPE type = TokenElevationTypeDefault;
     DWORD size = 0;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token.value) ||
-        !GetTokenInformation(token.value, TokenElevationType, &type, sizeof(type), &size)) {
-        error = WindowsError(L"Unable to check the program's privileges.", GetLastError());
-        return false;
-    }
-    return true;
+    return OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token.value) &&
+           GetTokenInformation(token.value, TokenElevationType, &type, sizeof(type), &size) &&
+           type == TokenElevationTypeFull;
 }
 
-static bool RelaunchElevated(std::wstring& error) {
-    std::vector<wchar_t> path(32768);
-    const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-    if (!length || length >= path.size()) {
-        error = L"Unable to locate the application to restart it as administrator.";
-        return false;
-    }
-
-    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    SHELLEXECUTEINFOW info{};
-    info.cbSize = sizeof(info);
-    info.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
-    info.lpVerb = L"runas";
-    info.lpFile = path.data();
-    info.nShow = SW_SHOWNORMAL;
-    const BOOL launched = ShellExecuteExW(&info);
-    const DWORD code = launched ? ERROR_SUCCESS : GetLastError();
-    if (SUCCEEDED(com)) CoUninitialize();
-    if (!launched && code != ERROR_CANCELLED)
-        error = WindowsError(L"Unable to restart the tray as administrator.", code);
-    return launched != FALSE;
-}
-
-int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (!argv) return static_cast<int>(gsync::ExitCode::Arguments);
-    const gsync::Action action = gsync::ParseArguments(argc, argv);
-    LocalFree(argv);
-
-    if (action == gsync::Action::Invalid) return static_cast<int>(gsync::ExitCode::Arguments);
-    if (action != gsync::Action::Tray) {
-        try {
-            return static_cast<int>(gsync::Execute(action).code);
-        } catch (...) {
-            return static_cast<int>(gsync::ExitCode::InternalError);
-        }
-    }
-
-    {
-        Handle existing(OpenMutexW(SYNCHRONIZE, FALSE, InstanceName));
-        if (existing || GetLastError() == ERROR_ACCESS_DENIED) return 0;
-    }
-
-    std::wstring error;
-    if (RegistryNeedsAdmin()) {
-        TOKEN_ELEVATION_TYPE elevation = TokenElevationTypeDefault;
-        if (!ReadElevation(elevation, error)) {
-            ShowError(error);
-            return 1;
-        }
-        if (elevation == TokenElevationTypeLimited) {
-            const bool launched = RelaunchElevated(error);
-            ShowError(error);
-            return launched ? 0 : 1;
-        }
-        if (elevation == TokenElevationTypeDefault) {
-            ShowError(
-                L"The G-SYNC state can only be read with administrator rights, and this account can't get them. Start the tray from an administrator account.");
-            return 1;
-        }
-    }
-
+static int RunTray(HINSTANCE instance)
+{
     g_instance.Reset(CreateMutexExW(nullptr, InstanceName, 0, SYNCHRONIZE));
     const DWORD instanceError = GetLastError();
-    if (instanceError == ERROR_ALREADY_EXISTS || (!g_instance && instanceError == ERROR_ACCESS_DENIED)) return 0;
-    if (!g_instance) {
-        ShowError(WindowsError(L"Unable to check whether the tray is already running.", instanceError));
+    if (instanceError == ERROR_ALREADY_EXISTS || (!g_instance && instanceError == ERROR_ACCESS_DENIED))
+        return 0;
+    if (!g_instance)
+    {
+        ShowError(WindowsError(L"The tray instance could not be checked.", instanceError));
         return 1;
     }
 
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
-    if (!g_taskbarCreated) {
-        ShowError(WindowsError(L"Unable to prepare the tray icon restore.", GetLastError()));
+    if (!g_taskbarCreated)
+    {
+        ShowError(WindowsError(L"The tray icon restore could not be prepared.", GetLastError()));
         return 1;
     }
 
-    const int ids[] = {IDI_ICON_OFF,     IDI_ICON_FULLSCREEN, IDI_ICON_WINDOWED,
-                       IDI_ICON_UNKNOWN, IDI_ICON_OFF_LIGHT,  IDI_ICON_UNKNOWN_LIGHT};
-    static_assert(std::size(ids) == std::size(g_icons), "One resource per icon");
     const int iconSize = GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem());
-    for (std::size_t i = 0; i < std::size(ids); ++i) {
+    for (std::size_t i = 0; i < IconCount; ++i)
+    {
         g_icons[i] = static_cast<HICON>(
-            LoadImageW(instance, MAKEINTRESOURCEW(ids[i]), IMAGE_ICON, iconSize, iconSize, LR_DEFAULTCOLOR));
-        if (!g_icons[i]) {
-            ShowError(WindowsError(L"Unable to load an icon.", GetLastError()));
+            LoadImageW(instance, MAKEINTRESOURCEW(IconResources[i]), IMAGE_ICON, iconSize, iconSize, LR_DEFAULTCOLOR));
+        if (!g_icons[i])
+        {
+            ShowError(WindowsError(L"An icon could not be loaded.", GetLastError()));
             return 1;
         }
     }
@@ -815,26 +1085,29 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = instance;
     wc.lpszClassName = WindowClass;
-    if (!RegisterClassW(&wc)) {
-        ShowError(WindowsError(L"Unable to prepare the tray window.", GetLastError()));
+    if (!RegisterClassW(&wc))
+    {
+        ShowError(WindowsError(L"The tray window could not be prepared.", GetLastError()));
         return 1;
     }
 
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, WindowClass, AppName, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance,
                              nullptr);
-    if (!g_hwnd) {
-        ShowError(WindowsError(L"Unable to create the tray window.", GetLastError()));
+    if (!g_hwnd)
+    {
+        ShowError(WindowsError(L"The tray window could not be created.", GetLastError()));
         return 1;
     }
 
-    if (!ChangeWindowMessageFilterEx(g_hwnd, g_taskbarCreated, MSGFLT_ALLOW, nullptr)) {
+    // Explorer broadcasts TaskbarCreated after a restart. UIPI blocks it when the tray runs elevated and Explorer
+    // does not.
+    if (!ChangeWindowMessageFilterEx(g_hwnd, g_taskbarCreated, MSGFLT_ALLOW, nullptr))
+    {
         const DWORD code = GetLastError();
-        TOKEN_ELEVATION_TYPE elevation = TokenElevationTypeDefault;
-        std::wstring ignored;
-        if (ReadElevation(elevation, ignored) && elevation == TokenElevationTypeFull)
-            ShowError(WindowsError(
-                L"Windows denied the permission used to restore the tray icon after Explorer restarts. The tray keeps running, but the icon may not come back in that case.",
-                code));
+        if (RunsElevated())
+            ShowError(WindowsError(L"Windows denied the permission used to restore the tray icon after Explorer "
+                                   L"restarts. The tray keeps running, but the icon may not come back in that case.",
+                                   code));
     }
 
     g_nid.cbSize = sizeof(g_nid);
@@ -842,28 +1115,60 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     g_nid.uID = 1;
     g_nid.uCallbackMessage = WMAPP_TRAYICON;
 
-    ReadSavedMode(g_preference);
-    if (!StartWatcher(error)) {
+    static_cast<void>(ReadSavedMode(g_preference));
+    std::wstring error;
+    if (!StartWatcher(error))
+    {
         ShowError(error);
-        Cleanup();
         return 1;
     }
-    RefreshTray();
 
-    int exitCode = 0;
     MSG msg{};
-    for (;;) {
+    for (;;)
+    {
         const BOOL got = GetMessageW(&msg, nullptr, 0, 0);
-        if (got == 0) break;
-        if (got == -1) {
-            ShowError(WindowsError(L"Error in the Windows message loop.", GetLastError()));
-            exitCode = 1;
-            break;
+        if (got == 0)
+            return static_cast<int>(msg.wParam);
+        if (got == -1)
+        {
+            ShowError(
+                WindowsError(L"The Windows message loop failed. Start GsyncStatusTrayToggle again.", GetLastError()));
+            return 1;
         }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    Cleanup();
-    UnregisterClassW(WindowClass, instance);
-    return exitCode;
+}
+
+int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int)
+{
+    bool tray = false;
+    int code = static_cast<int>(gsync::ExitCode::InternalError);
+    try
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (!argv)
+            return static_cast<int>(gsync::ExitCode::Arguments);
+        const gsync::Action action = gsync::ParseArguments(argc, argv);
+        LocalFree(argv);
+        if (action == gsync::Action::Invalid)
+            return static_cast<int>(gsync::ExitCode::Arguments);
+        if (action != gsync::Action::Tray)
+            return static_cast<int>(gsync::Execute(action).code);
+        tray = true;
+        code = RunTray(instance);
+    }
+    catch (...)
+    {
+        code = static_cast<int>(gsync::ExitCode::InternalError);
+    }
+
+    if (tray)
+    {
+        Cleanup(instance);
+        if (code == static_cast<int>(gsync::ExitCode::InternalError))
+            MessageBoxW(nullptr, InternalErrorText, AppName, MB_OK | MB_ICONERROR | MB_TOPMOST);
+    }
+    return code;
 }

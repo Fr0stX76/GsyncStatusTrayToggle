@@ -1,0 +1,12 @@
+out/
+build.log
+tests.log
+/GsyncStatusTrayToggle.exe
+/GsyncLogicTests.exe
+*.obj
+*.res
+*.nativecodeanalysis.xml
+.vs/
+*.aps
+*.user
+build.cmd

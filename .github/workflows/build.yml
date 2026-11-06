@@ -1,0 +1,35 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      # Pinned to commits: a moved tag cannot change what runs here.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Build and test
+        shell: cmd
+        # Same commands as the README; any warning fails the build.
+        run: |
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          set "VC_TOOLS=Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+          "%VSWHERE%" -latest -products * -requires %VC_TOOLS% -property installationPath > vs-path.txt
+          set /p VS_PATH=<vs-path.txt
+          call "%VS_PATH%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          where cl.exe || exit /b 1
+          cl /nologo /O2 /MT /EHsc /std:c++17 /utf-8 /W4 /WX /analyze /DUNICODE tests\GsyncLogicTests.cpp || exit /b 1
+          GsyncLogicTests.exe || exit /b 1
+          rc /nologo GsyncStatusTrayToggle.rc || exit /b 1
+          cl /nologo /O2 /GL /MT /EHsc /std:c++17 /utf-8 /W4 /WX /analyze /analyze:external- /Brepro /DUNICODE ^
+            /external:anglebrackets /external:W0 /external:I nvapi\include ^
+            GsyncStatusTrayToggle.cpp GsyncStatusTrayToggle.res ^
+            /link /SUBSYSTEM:WINDOWS /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF /MANIFEST:NO ^
+            /DEPENDENTLOADFLAG:0x800 /Brepro ^
+            /LIBPATH:nvapi\lib\amd64 nvapi64.lib user32.lib shell32.lib advapi32.lib gdi32.lib dwmapi.lib ^
+            shcore.lib cfgmgr32.lib || exit /b 1

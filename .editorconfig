@@ -1,0 +1,47 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+trim_trailing_whitespace = true
+max_line_length = 120
+
+[*.md]
+max_line_length = off
+trim_trailing_whitespace = false
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[*.sln]
+indent_style = tab
+
+[*.cs]
+dotnet_diagnostic.CA1716.severity = none
+dotnet_diagnostic.CA1720.severity = none
+
+[src/AutoTrigger/App*.cs]
+dotnet_diagnostic.CA1001.severity = none
+
+[src/AutoTrigger.Core/Engine/EngineLoop.cs]
+dotnet_diagnostic.CA2000.severity = none
+
+[src/AutoTrigger/Ui/Common/NativeUi.CommonControls.cs]
+dotnet_diagnostic.CA5393.severity = none
+
+[tests/**.cs]
+dotnet_diagnostic.CA1001.severity = none
+dotnet_diagnostic.CA1051.severity = none
+dotnet_diagnostic.CA1861.severity = none
+
+[nvapi/**]
+charset = unset
+end_of_line = unset
+indent_style = unset
+indent_size = unset
+insert_final_newline = unset
+trim_trailing_whitespace = unset
+max_line_length = unset

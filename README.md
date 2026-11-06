@@ -23,7 +23,7 @@ Not affiliated with NVIDIA.
 
 ## Usage
 
-Download the zip from the Releases page, extract it and run GsyncStatusTrayToggle.exe.
+Download the zip from the Releases page, extract it and run `GsyncStatusTrayToggle.exe`. The program is not signed: if SmartScreen warns, choose **More info**, then **Run anyway**.
 
 - **Left-click:** G-SYNC on or off.
 - **Right-click:** Fullscreen, Fullscreen + Windowed, Start with Windows, Exit.
@@ -38,7 +38,24 @@ Download the zip from the Releases page, extract it and run GsyncStatusTrayToggl
 | `GsyncStatusTrayToggle.exe /fs` | G-SYNC on, fullscreen only |
 | `GsyncStatusTrayToggle.exe /fsw` | G-SYNC on, fullscreen and windowed |
 
-Exit code 0 means success. Other codes are listed in `GsyncCore.h`.
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | The G-SYNC lock could not be opened |
+| 2 | Another G-SYNC command is still running |
+| 3 | The G-SYNC lock could not be acquired |
+| 10 | NVAPI could not be initialized (NVIDIA driver missing?) |
+| 11 | The NVIDIA settings could not be opened |
+| 12 | The NVIDIA settings could not be loaded |
+| 13 | The NVIDIA global profile could not be opened |
+| 14 | A G-SYNC setting could not be read, or its value is unknown. Nothing was changed |
+| 15 | NVIDIA rejected the change. Part of it may already be saved |
+| 16 | The NVIDIA settings could not be saved. Part of the change may already be saved |
+| 17 | Saved, but the result could not be confirmed or the displays could not be redrawn |
+| 20 | Internal error |
+| 64 | Invalid arguments |
+
+Without arguments, the tray exits with 0, with 1 if it cannot start, or with 20.
 
 ### Uninstall
 
@@ -49,15 +66,19 @@ Uncheck Start with Windows, choose Exit, then delete the EXE.
 MSVC x64 and a Windows 11 SDK, from an x64 Native Tools Command Prompt:
 
 ```
-rc GsyncStatusTrayToggle.rc
-cl /std:c++17 /EHsc /O2 /MT /DUNICODE /I nvapi\include GsyncStatusTrayToggle.cpp GsyncStatusTrayToggle.res /link /SUBSYSTEM:WINDOWS /MANIFEST:NO /LIBPATH:nvapi\lib\amd64 nvapi64.lib user32.lib shell32.lib advapi32.lib ole32.lib gdi32.lib dwmapi.lib shcore.lib cfgmgr32.lib
+cl /nologo /O2 /MT /EHsc /std:c++17 /utf-8 /W4 /WX /analyze /DUNICODE tests\GsyncLogicTests.cpp
+GsyncLogicTests.exe
+rc /nologo GsyncStatusTrayToggle.rc
+cl /nologo /O2 /GL /MT /EHsc /std:c++17 /utf-8 /W4 /WX /analyze /analyze:external- /Brepro /DUNICODE /external:anglebrackets /external:W0 /external:I nvapi\include GsyncStatusTrayToggle.cpp GsyncStatusTrayToggle.res /link /SUBSYSTEM:WINDOWS /MACHINE:X64 /LTCG /OPT:REF /OPT:ICF /MANIFEST:NO /DEPENDENTLOADFLAG:0x800 /Brepro /LIBPATH:nvapi\lib\amd64 nvapi64.lib user32.lib shell32.lib advapi32.lib gdi32.lib dwmapi.lib shcore.lib cfgmgr32.lib
 ```
+
+The build is reproducible: the same source, compiler version and command give the same SHA-256. GitHub builds and tests every change. How the code is organized: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 The NVAPI headers and library are included in `nvapi\` ([NVIDIA/nvapi](https://github.com/NVIDIA/nvapi), MIT license).
 
 ## How it works
 
-The tray reads the driver's registry value `0x1194f158` under `HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\State` and updates when it changes.
+The tray reads G-SYNC - Application Mode in the NVIDIA global profile through NVAPI. It updates when NVIDIA saves its settings in `%ProgramData%\NVIDIA Corporation\Drs`, which happens for every change, from the NVIDIA Control Panel or any other tool. No administrator rights are needed.
 
 A change writes these settings in the NVIDIA global profile through NVAPI, in the same order as the NVIDIA Control Panel:
 

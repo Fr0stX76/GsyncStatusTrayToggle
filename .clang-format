@@ -1,0 +1,11 @@
+BasedOnStyle: Microsoft
+AccessModifierOffset: -4
+BraceWrapping:
+  AfterCaseLabel: true
+  AfterUnion: true
+  BeforeLambdaBody: true
+FixNamespaceComments: false
+InsertNewlineAtEOF: true
+PointerAlignment: Left
+SortIncludes: Never
+AlignConsecutiveMacros: Consecutive

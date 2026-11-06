@@ -1,4 +1,4 @@
-﻿GsyncStatusTrayToggle 1.0
+GsyncStatusTrayToggle
 Copyright © 2026 Fr0stX76
 Licensed under the MIT License. See LICENSE.
 
