@@ -9,6 +9,7 @@ Not affiliated with NVIDIA.
 - Tray icon shows the current state: Off, Fullscreen or Fullscreen + Windowed.
 - One-click toggle that follows the NVIDIA Control Panel's sequence.
 - Stays in sync with changes made in the NVIDIA Control Panel or other tools.
+- Allows or disallows G-SYNC for each display model, like **Enable settings for the selected display model** in the NVIDIA Control Panel.
 - Command line support.
 
 | | Off | Fullscreen | Fullscreen + Windowed |
@@ -26,9 +27,19 @@ Not affiliated with NVIDIA.
 Download the zip from the Releases page, extract it and run `GsyncStatusTrayToggle.exe`. The program is not signed: if SmartScreen warns, choose **More info**, then **Run anyway**.
 
 - **Left-click:** G-SYNC on or off.
-- **Right-click:** Fullscreen, Fullscreen + Windowed, Start with Windows, Exit.
+- **Right-click:** Fullscreen, Fullscreen + Windowed, Allow G-SYNC, Start with Windows, Exit.
 
 <img src="images/menu.png" alt="Tray menu">
+
+### Allow G-SYNC on a display
+
+**Allow G-SYNC** lists the displays that offer VRR, one line per model: identical displays share one line. A checked display can use G-SYNC. This is the same choice as **Enable settings for the selected display model** in the NVIDIA Control Panel, and each one shows the change made in the other.
+
+- NVIDIA accepts this choice only while G-SYNC is on. The lines are grayed out while it is off.
+- A display whose VRR is off in its own menu is not listed. It appears once VRR is turned on there.
+- When G-SYNC is on but not allowed on a display, the tray tooltip says so.
+- Some displays keep showing VRR in their own menu after G-SYNC is disallowed. The NVIDIA Control Panel gives the same result.
+- Changing the choice can make the display go black for about a second.
 
 ### Command line
 
@@ -37,6 +48,19 @@ Download the zip from the Releases page, extract it and run `GsyncStatusTrayTogg
 | `GsyncStatusTrayToggle.exe /off` | G-SYNC off |
 | `GsyncStatusTrayToggle.exe /fs` | G-SYNC on, fullscreen only |
 | `GsyncStatusTrayToggle.exe /fsw` | G-SYNC on, fullscreen and windowed |
+| `GsyncStatusTrayToggle.exe /allow NAME` | Allow G-SYNC on the display model `NAME` |
+| `GsyncStatusTrayToggle.exe /disallow NAME` | Disallow G-SYNC on the display model `NAME` |
+| `GsyncStatusTrayToggle.exe /list \| more` | List the NVIDIA displays, their model code and their choice |
+
+`NAME` is the display name shown by Windows, such as `Q90A`, or its model code from `/list`, such as `SAM713F`. Case does not matter. Put a name with spaces in quotes: `/allow "ASUS MG28U"`. G-SYNC must be on. A display whose VRR is off in its own menu keeps the choice until VRR is turned on there.
+
+The program has no console window, so a command prompt does not wait for it: `/list` would print after the next prompt. `| more` makes the prompt wait. In a `.cmd` script, every command waits.
+
+```
+Display     Model    G-SYNC       VRR
+Q90A        SAM713F  allowed      available
+ASUS MG28U  ACI28A7  not allowed  not available
+```
 
 | Exit code | Meaning |
 | --- | --- |
@@ -53,9 +77,13 @@ Download the zip from the Releases page, extract it and run `GsyncStatusTrayTogg
 | 16 | The NVIDIA settings could not be saved. Part of the change may already be saved |
 | 17 | Saved, but the result could not be confirmed or the displays could not be redrawn |
 | 20 | Internal error |
+| 30 | No active NVIDIA display has this name or model code. Nothing was changed |
+| 31 | Several display models have this name. Use the model code. Nothing was changed |
+| 32 | G-SYNC is off. Nothing was changed |
+| 33 | The displays could not be read, or NVIDIA could not apply the choice to a display |
 | 64 | Invalid arguments |
 
-Without arguments, the tray exits with 0, with 1 if it cannot start, or with 20.
+`/allow` and `/disallow` also use 10 to 17: 15 when NVIDIA rejects the choice, 16 when it cannot be saved, 17 when the display does not confirm it. Without arguments, the tray exits with 0, with 1 if it cannot start, or with 20.
 
 ### Uninstall
 
@@ -91,6 +119,8 @@ A change writes these settings in the NVIDIA global profile through NVAPI, in th
 | Preferred Refreshrate | `0x0064B541` | 0 | 1 | 1 |
 
 When G-SYNC is turned on or off, the driver disconnects and reconnects the display. The app waits for it to come back, redraws the displays once, and restores their refresh rate if needed. The Control Panel toggles virtual resolution support instead, which redraws twice and, done from another app, often drops VRR for a moment. A change takes about 3.5 seconds and the screen blinks once.
+
+The choice for a display model lives where the NVIDIA Control Panel keeps it: a hidden NVIDIA profile named after the EDID manufacturer and product codes, such as `0x2D4C:0x713F`, with one application of the same name in lower case, setting `0x106D5CFF` (hide the profile) at 1, and `0x1194F158` at 1 when G-SYNC is allowed or 0 when it is not. The driver reads this profile only when the display reconnects, so the app also applies the choice to each display of the model right away through NVAPI, as the Control Panel does, then checks it once the display is back.
 
 The selected mode is stored in `HKCU\Software\GsyncStatusTrayToggle`. Start with Windows uses the standard `Run` key.
 

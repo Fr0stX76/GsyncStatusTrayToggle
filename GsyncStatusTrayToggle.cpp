@@ -10,6 +10,7 @@
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <vector>
 #include "resource.h"
 #include "GsyncCore.h"
 #include "TrayMenu.h"
@@ -29,6 +30,8 @@ constexpr unsigned TrayRetryLimit = 10;
 constexpr DWORD WatchRetryFirst = 500;
 constexpr DWORD WatchRetryMax = 10000;
 constexpr DWORD SettleWait = 250;
+constexpr DWORD DisplaySettle = 1000;
+constexpr std::size_t MenuDisplayLimit = 16;
 constexpr ULONGLONG ClickDelay = 5000;
 constexpr wchar_t InstanceName[] = L"Local\\GsyncStatusTrayToggle.Instance";
 constexpr wchar_t WindowClass[] = L"GsyncStatusTrayToggleClass";
@@ -120,12 +123,17 @@ static std::atomic<State> g_profileState{State::Unknown};
 static Handle g_watchStop;
 static Handle g_readRequest;
 static Handle g_watchThread;
+static Handle g_displayChange;
+static HCMNOTIFICATION g_monitorNotification = nullptr;
 static std::atomic<bool> g_refreshQueued{false};
+static std::mutex g_displayData;
+static std::vector<gsync::DisplayModel> g_displays;
 
 struct CommandJob
 {
     gsync::Action action = gsync::Action::Invalid;
     Mode preference = Mode::Fullscreen;
+    std::wstring display;
     gsync::Result result;
 };
 
@@ -136,10 +144,11 @@ static ULONGLONG g_lastClick = 0;
 
 static HMENU g_activeMenu = nullptr;
 static traymenu::Visual* g_menuVisual = nullptr;
-static traymenu::Item g_menuItems[] = {{ID_TRAY_FULLSCREEN, L"Fullscreen"},
-                                       {ID_TRAY_WINDOWED, L"Fullscreen + Windowed"},
-                                       {ID_TRAY_STARTUP, L"Start with Windows"},
-                                       {ID_TRAY_EXIT, L"Exit"}};
+// Rebuilt each time the menu opens. The items point into g_menuLabels, and a chosen display is read from
+// g_menuDisplays after the menu has closed.
+static std::vector<traymenu::Item> g_menuItems;
+static std::vector<std::wstring> g_menuLabels;
+static std::vector<gsync::DisplayModel> g_menuDisplays;
 static RECT g_menuIcon{};
 static bool g_menuRefresh = false;
 
@@ -302,12 +311,25 @@ static void RequestState()
 static void PublishState()
 {
     State state = State::Unknown;
+    std::vector<gsync::DisplayModel> displays;
     {
         const std::lock_guard<std::mutex> guard(g_nvapi);
         state = gsync::ReadState();
+        if (!gsync::ReadModels(displays))
+            displays.clear();
     }
     g_profileState = state;
+    {
+        const std::lock_guard<std::mutex> guard(g_displayData);
+        g_displays = std::move(displays);
+    }
     QueueRefresh();
+}
+
+static std::vector<gsync::DisplayModel> CurrentDisplays()
+{
+    const std::lock_guard<std::mutex> guard(g_displayData);
+    return g_displays;
 }
 
 static DWORD NextRetry(DWORD ms)
@@ -421,26 +443,34 @@ public:
 
 // NVIDIA saves its settings in these files whichever program makes the change, and watching them needs no
 // administrator rights, unlike the driver's registry key. One save rewrites three files, so the profile is read
-// once they are quiet.
+// once they are quiet. Windows announces a reconnected display before the driver reports its VRR data, so a
+// display change waits longer.
 static bool FollowSettings(SettingsWatch& watch)
 {
-    const HANDLE waits[] = {g_watchStop.value, g_readRequest.value, watch.Event()};
-    bool pending = false;
+    const HANDLE waits[] = {g_watchStop.value, g_readRequest.value, watch.Event(), g_displayChange.value};
+    DWORD settle = 0;
     for (;;)
     {
-        const DWORD wait = WaitForMultipleObjects(3, waits, FALSE, pending ? SettleWait : INFINITE);
+        const DWORD wait =
+            WaitForMultipleObjects(static_cast<DWORD>(std::size(waits)), waits, FALSE, settle ? settle : INFINITE);
         if (wait == WAIT_OBJECT_0)
             return true;
         if (wait == WAIT_OBJECT_0 + 1 || wait == WAIT_TIMEOUT)
         {
-            pending = false;
+            settle = 0;
             PublishState();
+            continue;
+        }
+        if (wait == WAIT_OBJECT_0 + 3)
+        {
+            settle = DisplaySettle;
             continue;
         }
         bool changed = false;
         if (wait != WAIT_OBJECT_0 + 2 || !watch.Collect(changed) || !watch.Arm())
             return false;
-        pending = pending || changed;
+        if (changed)
+            settle = (std::max)(settle, SettleWait);
     }
 }
 
@@ -464,11 +494,11 @@ static void WatchSettings()
             if (FollowSettings(watch))
                 return;
         }
-        const HANDLE waits[] = {g_watchStop.value, g_readRequest.value};
-        const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, retry);
+        const HANDLE waits[] = {g_watchStop.value, g_readRequest.value, g_displayChange.value};
+        const DWORD wait = WaitForMultipleObjects(static_cast<DWORD>(std::size(waits)), waits, FALSE, retry);
         if (wait == WAIT_TIMEOUT)
             retry = NextRetry(retry);
-        else if (wait == WAIT_OBJECT_0 + 1)
+        else if (wait == WAIT_OBJECT_0 + 1 || wait == WAIT_OBJECT_0 + 2)
             publish = true;
         else
             return;
@@ -497,7 +527,10 @@ static unsigned __stdcall CommandThreadProc(void*) noexcept
     try
     {
         const std::lock_guard<std::mutex> guard(g_nvapi);
-        g_command.result = gsync::Execute(g_command.action, g_command.preference);
+        const gsync::Action action = g_command.action;
+        g_command.result = action == gsync::Action::Allow || action == gsync::Action::Disallow
+                               ? gsync::ChooseForDisplay(g_command.display, action == gsync::Action::Allow)
+                               : gsync::Execute(action, g_command.preference);
     }
     catch (...)
     {
@@ -530,12 +563,13 @@ static void FinishCommand()
         static_cast<void>(PostMessageW(g_hwnd, WM_CLOSE, 0, 0));
 }
 
-static void StartCommand(gsync::Action action)
+static void StartCommand(gsync::Action action, const std::wstring& display = {})
 {
     if (g_busy || g_errorDialog || g_stopping || g_exitRequested)
         return;
     g_command.action = action;
     g_command.preference = g_preference;
+    g_command.display = display;
     g_command.result = {};
     g_busy = true;
     UpdateMenuChecks();
@@ -576,26 +610,11 @@ static HICON StateIcon(State state)
     }
 }
 
-static void SetTrayState(State state)
+static void SetTrayState(State state, const std::wstring& tip)
 {
-    const wchar_t* tip = L"G-SYNC Unknown";
-    switch (state)
-    {
-    case State::Off:
-        tip = L"G-SYNC Off";
-        break;
-    case State::Fullscreen:
-        tip = L"G-SYNC Fullscreen";
-        break;
-    case State::Windowed:
-        tip = L"G-SYNC Fullscreen + Windowed";
-        break;
-    default:
-        break;
-    }
     g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     g_nid.hIcon = StateIcon(state);
-    if (!lstrcpynW(g_nid.szTip, tip, static_cast<int>(std::size(g_nid.szTip))))
+    if (!lstrcpynW(g_nid.szTip, tip.c_str(), static_cast<int>(std::size(g_nid.szTip))))
         g_nid.szTip[0] = L'\0';
 }
 
@@ -619,9 +638,9 @@ static void ScheduleTrayRetry()
     g_trayRetryActive = true;
 }
 
-static bool AddTrayIcon(State state)
+static bool AddTrayIcon(State state, const std::wstring& tip)
 {
-    SetTrayState(state);
+    SetTrayState(state, tip);
     if (!Shell_NotifyIconW(NIM_ADD, &g_nid) && !Shell_NotifyIconW(NIM_MODIFY, &g_nid))
         return false;
     g_nid.uVersion = NOTIFYICON_VERSION_4;
@@ -640,25 +659,27 @@ static void RefreshTray()
     if (g_stopping)
         return;
     const State state = g_profileState.load();
+    const std::wstring tip = gsync::TrayTip(state, CurrentDisplays());
     if (!g_iconAdded)
     {
-        if (!AddTrayIcon(state))
+        if (!AddTrayIcon(state, tip))
             ScheduleTrayRetry();
     }
-    else if (StateIcon(state) != g_nid.hIcon)
+    else if (StateIcon(state) != g_nid.hIcon || tip != g_nid.szTip)
     {
-        SetTrayState(state);
+        SetTrayState(state, tip);
         if (!Shell_NotifyIconW(NIM_MODIFY, &g_nid))
         {
             static_cast<void>(Shell_NotifyIconW(NIM_DELETE, &g_nid));
             g_iconAdded = false;
-            if (!AddTrayIcon(state))
+            if (!AddTrayIcon(state, tip))
                 ScheduleTrayRetry();
         }
     }
 
     if (!g_busy)
         ObserveActiveMode(state);
+    UpdateMenuChecks();
 }
 
 static void RemoveTrayIcon()
@@ -669,23 +690,37 @@ static void RemoveTrayIcon()
     g_iconAdded = false;
 }
 
+static void SetItemState(UINT id, bool checked, bool grayed)
+{
+    MENUITEMINFOW item{};
+    item.cbSize = sizeof(item);
+    item.fMask = MIIM_STATE;
+    item.fState = static_cast<UINT>((checked ? MFS_CHECKED : MFS_UNCHECKED) | (grayed ? MFS_GRAYED : MFS_ENABLED));
+    const UINT previous = GetMenuState(g_activeMenu, id, MF_BYCOMMAND);
+    if (previous != static_cast<UINT>(-1))
+        item.fState |= previous & MFS_HILITE;
+    static_cast<void>(SetMenuItemInfoW(g_activeMenu, id, FALSE, &item));
+}
+
 static void UpdateMenuChecks()
 {
     if (!g_activeMenu)
         return;
     const UINT selected = g_preference == Mode::Fullscreen ? ID_TRAY_FULLSCREEN : ID_TRAY_WINDOWED;
     for (const UINT id : {static_cast<UINT>(ID_TRAY_FULLSCREEN), static_cast<UINT>(ID_TRAY_WINDOWED)})
-    {
-        MENUITEMINFOW item{};
-        item.cbSize = sizeof(item);
-        item.fMask = MIIM_STATE;
-        item.fState =
-            static_cast<UINT>((id == selected ? MFS_CHECKED : MFS_UNCHECKED) | (g_busy ? MFS_GRAYED : MFS_ENABLED));
-        const UINT previous = GetMenuState(g_activeMenu, id, MF_BYCOMMAND);
-        if (previous != static_cast<UINT>(-1))
-            item.fState |= previous & MFS_HILITE;
-        static_cast<void>(SetMenuItemInfoW(g_activeMenu, id, FALSE, &item));
-    }
+        SetItemState(id, id == selected, g_busy);
+    // NVIDIA refuses the display choice while G-SYNC is off, and the Control Panel grays it out too.
+    const bool locked = g_busy || !gsync::IsOn(g_profileState.load());
+    for (std::size_t i = 0; i < g_menuDisplays.size(); ++i)
+        SetItemState(static_cast<UINT>(ID_TRAY_DISPLAY + i), g_menuDisplays[i].allowed, locked);
+}
+
+static void ChooseMenuDisplay(std::size_t index)
+{
+    if (index >= g_menuDisplays.size() || !gsync::IsOn(g_profileState.load()))
+        return;
+    const gsync::DisplayModel& display = g_menuDisplays[index];
+    StartCommand(display.allowed ? gsync::Action::Disallow : gsync::Action::Allow, gsync::ModelCode(display));
 }
 
 static void DispatchMenuCommand(UINT command)
@@ -698,6 +733,39 @@ static void DispatchMenuCommand(UINT command)
         StartCommand(gsync::Action::SelectWindowed);
     else if (command == ID_TRAY_STARTUP)
         ToggleStartup();
+    else if (command >= static_cast<UINT>(ID_TRAY_DISPLAY))
+        ChooseMenuDisplay(command - static_cast<UINT>(ID_TRAY_DISPLAY));
+}
+
+static void BuildMenuItems()
+{
+    g_menuItems.clear();
+    g_menuLabels.clear();
+    g_menuDisplays.clear();
+    const std::vector<gsync::DisplayModel> displays = CurrentDisplays();
+    for (std::size_t i = 0; i < displays.size() && g_menuDisplays.size() < MenuDisplayLimit; ++i)
+    {
+        // Without VRR, or with VRR off in the monitor's own menu, NVIDIA offers no choice for the display.
+        if (!displays[i].vrr)
+            continue;
+        g_menuDisplays.push_back(displays[i]);
+        g_menuLabels.push_back(gsync::ModelLabel(displays, i));
+    }
+
+    using traymenu::Kind;
+    using traymenu::MakeItem;
+    g_menuItems.push_back(MakeItem(ID_TRAY_FULLSCREEN, L"Fullscreen"));
+    g_menuItems.push_back(MakeItem(ID_TRAY_WINDOWED, L"Fullscreen + Windowed"));
+    if (!g_menuDisplays.empty())
+    {
+        g_menuItems.push_back(MakeItem(0, L"", Kind::Separator));
+        g_menuItems.push_back(MakeItem(ID_TRAY_DISPLAYS, L"Allow G-SYNC", Kind::Title));
+        for (std::size_t i = 0; i < g_menuLabels.size(); ++i)
+            g_menuItems.push_back(MakeItem(static_cast<UINT>(ID_TRAY_DISPLAY + i), g_menuLabels[i].c_str()));
+        g_menuItems.push_back(MakeItem(0, L"", Kind::Separator));
+    }
+    g_menuItems.push_back(MakeItem(ID_TRAY_STARTUP, L"Start with Windows"));
+    g_menuItems.push_back(MakeItem(ID_TRAY_EXIT, L"Exit"));
 }
 
 static bool IsRightButtonMessage(UINT message)
@@ -759,6 +827,7 @@ static void ShowTrayMenu(const POINT* shellAnchor)
     if (g_stopping || g_exitRequested)
         return;
 
+    BuildMenuItems();
     traymenu::Visual visual;
     MenuHandle menu;
     menu.value = CreatePopupMenu();
@@ -767,7 +836,8 @@ static void ShowTrayMenu(const POINT* shellAnchor)
         ShowError(WindowsError(L"The menu could not be opened.", GetLastError()));
         return;
     }
-    if (!visual.Prepare(g_hwnd, traymenu::MonitorDpi(placement.point), menu.value, g_menuItems, std::size(g_menuItems)))
+    if (!visual.Prepare(g_hwnd, traymenu::MonitorDpi(placement.point), menu.value, g_menuItems.data(),
+                        g_menuItems.size()))
     {
         ShowError(WindowsError(L"The menu could not be prepared.", visual.Error()));
         return;
@@ -882,32 +952,14 @@ static LRESULT HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
     }
     case WM_MENUCHAR:
-    {
         if (!g_activeMenu || reinterpret_cast<HMENU>(lParam) != g_activeMenu)
             break;
-        wchar_t key = static_cast<wchar_t>(LOWORD(wParam));
-        if (key >= L'a' && key <= L'z')
-            key = static_cast<wchar_t>(key - L'a' + L'A');
-        int first = -1, next = -1, current = -1, matches = 0;
-        const int count = static_cast<int>(std::size(g_menuItems));
-        for (int i = 0; i < count; ++i)
-            if (GetMenuState(g_activeMenu, g_menuItems[i].id, MF_BYCOMMAND) & MF_HILITE)
-                current = i;
-        for (int i = 0; i < count; ++i)
-        {
-            const UINT state = GetMenuState(g_activeMenu, g_menuItems[i].id, MF_BYCOMMAND);
-            if ((state & (MF_GRAYED | MF_DISABLED)) || key != g_menuItems[i].text[0])
-                continue;
-            if (first < 0)
-                first = i;
-            if (i > current && next < 0)
-                next = i;
-            ++matches;
-        }
-        if (!matches)
-            return MAKELRESULT(0, MNC_IGNORE);
-        return MAKELRESULT(next < 0 ? first : next, matches == 1 ? MNC_EXECUTE : MNC_SELECT);
-    }
+        return traymenu::MenuKey(g_activeMenu, g_menuItems.data(), g_menuItems.size(),
+                                 static_cast<wchar_t>(LOWORD(wParam)));
+    case WM_DISPLAYCHANGE:
+        if (g_displayChange)
+            static_cast<void>(SetEvent(g_displayChange.value));
+        return 0;
     case WMAPP_TRAYICON:
     {
         const UINT event = LOWORD(lParam);
@@ -987,11 +1039,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 }
 
+// The driver can reconnect a display without changing its mode, for example when it applies the G-SYNC choice
+// after VRR is turned on in the monitor's own menu. Windows sends no WM_DISPLAYCHANGE then, so monitor arrivals and
+// removals also make the watcher read the displays. Runs on a system thread pool thread.
+static DWORD CALLBACK MonitorChanged(HCMNOTIFICATION, PVOID, CM_NOTIFY_ACTION action, PCM_NOTIFY_EVENT_DATA,
+                                     DWORD) noexcept
+{
+    if (action == CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL || action == CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL)
+        static_cast<void>(SetEvent(g_displayChange.value));
+    return ERROR_SUCCESS;
+}
+
+static void WatchMonitors()
+{
+    CM_NOTIFY_FILTER filter{};
+    filter.cbSize = sizeof(filter);
+    filter.FilterType = CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE;
+    filter.u.DeviceInterface.ClassGuid = gsync::MonitorInterface;
+    // Without these notifications, WM_DISPLAYCHANGE and the menu still trigger reads; only a mode-less reconnect
+    // shows late.
+    if (CM_Register_Notification(&filter, nullptr, MonitorChanged, &g_monitorNotification) != CR_SUCCESS)
+        g_monitorNotification = nullptr;
+}
+
 static bool StartWatcher(std::wstring& error)
 {
     g_watchStop.Reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
     g_readRequest.Reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
-    if (!g_watchStop || !g_readRequest)
+    g_displayChange.Reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+    if (!g_watchStop || !g_readRequest || !g_displayChange)
     {
         error = WindowsError(L"The change monitoring could not be prepared.", GetLastError());
         return false;
@@ -1004,12 +1080,17 @@ static bool StartWatcher(std::wstring& error)
         return false;
     }
     static_cast<void>(SetThreadPriority(g_watchThread.value, THREAD_PRIORITY_LOWEST));
+    WatchMonitors();
     return true;
 }
 
 static void Cleanup(HINSTANCE instance)
 {
     g_stopping = true;
+    // Returns once no callback is running, so the event it signals can be closed below.
+    if (g_monitorNotification)
+        static_cast<void>(CM_Unregister_Notification(g_monitorNotification));
+    g_monitorNotification = nullptr;
     if (g_commandThread)
         static_cast<void>(WaitForSingleObject(g_commandThread.value, INFINITE));
     const bool watcherStopped = !g_watchThread || (SetEvent(g_watchStop.value) &&
@@ -1020,6 +1101,7 @@ static void Cleanup(HINSTANCE instance)
         g_watchThread.Reset();
         g_watchStop.Reset();
         g_readRequest.Reset();
+        g_displayChange.Reset();
     }
 
     if (g_hwnd && IsWindow(g_hwnd))
@@ -1140,6 +1222,54 @@ static int RunTray(HINSTANCE instance)
     }
 }
 
+// The program is windowed so that the tray never opens a console. /list therefore writes to its redirected output,
+// or else to the console of the command prompt that started it, which does not wait for a windowed program.
+static void WriteText(const std::wstring& text, DWORD stream)
+{
+    HANDLE output = GetStdHandle(stream);
+    Handle console;
+    if (!output || output == INVALID_HANDLE_VALUE)
+    {
+        const HANDLE opened = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                          nullptr, OPEN_EXISTING, 0, nullptr);
+        if (opened == INVALID_HANDLE_VALUE)
+            return;
+        console.Reset(opened);
+        output = opened;
+    }
+    DWORD mode = 0;
+    DWORD written = 0;
+    if (GetConsoleMode(output, &mode))
+    {
+        static_cast<void>(WriteConsoleW(output, text.c_str(), static_cast<DWORD>(text.size()), &written, nullptr));
+        return;
+    }
+    const UINT page = GetConsoleOutputCP() ? GetConsoleOutputCP() : CP_UTF8;
+    const int length = static_cast<int>(text.size());
+    const int size = WideCharToMultiByte(page, 0, text.c_str(), length, nullptr, 0, nullptr, nullptr);
+    if (size <= 0)
+        return;
+    std::string bytes(static_cast<std::size_t>(size), '\0');
+    if (WideCharToMultiByte(page, 0, text.c_str(), length, bytes.data(), size, nullptr, nullptr) != size)
+        return;
+    for (DWORD offset = 0; offset < static_cast<DWORD>(size); offset += written)
+        if (!WriteFile(output, bytes.data() + offset, static_cast<DWORD>(size) - offset, &written, nullptr) || !written)
+            return;
+}
+
+static int RunList()
+{
+    // Attached first, so that a redirected output uses the code page of the console that started the command.
+    static_cast<void>(AttachConsole(ATTACH_PARENT_PROCESS));
+    std::vector<gsync::DisplayModel> displays;
+    const gsync::Result result = gsync::ListModels(displays);
+    if (result.code == gsync::ExitCode::Success)
+        WriteText(gsync::ListText(displays), STD_OUTPUT_HANDLE);
+    else
+        WriteText(result.error + L"\r\n", STD_ERROR_HANDLE);
+    return static_cast<int>(result.code);
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int)
 {
     bool tray = false;
@@ -1150,12 +1280,17 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPWSTR, 
         LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
         if (!argv)
             return static_cast<int>(gsync::ExitCode::Arguments);
-        const gsync::Action action = gsync::ParseArguments(argc, argv);
+        const gsync::Command command = gsync::ParseCommand(argc, argv);
         LocalFree(argv);
-        if (action == gsync::Action::Invalid)
+        if (command.action == gsync::Action::Invalid)
             return static_cast<int>(gsync::ExitCode::Arguments);
-        if (action != gsync::Action::Tray)
-            return static_cast<int>(gsync::Execute(action).code);
+        if (command.action == gsync::Action::List)
+            return RunList();
+        if (command.action == gsync::Action::Allow || command.action == gsync::Action::Disallow)
+            return static_cast<int>(
+                gsync::ChooseForDisplay(command.display, command.action == gsync::Action::Allow).code);
+        if (command.action != gsync::Action::Tray)
+            return static_cast<int>(gsync::Execute(command.action).code);
         tray = true;
         code = RunTray(instance);
     }

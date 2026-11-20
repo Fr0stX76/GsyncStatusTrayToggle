@@ -6,9 +6,9 @@ How the code is organized, for anyone who maintains it. Comments in the code exp
 
 | File | Contents |
 | --- | --- |
-| `GsyncLogic.h` | Pure logic, without Windows: states, command-line parsing, what a click, the menu or a command must do, the five setting values, exit codes. |
-| `GsyncCore.h` | NVAPI and display work, shared by the tray and the command line: the machine-wide lock, reading and saving the NVIDIA global profile, waiting for the display, the redraw and the refresh-rate check. |
-| `TrayMenu.h` | The owner-drawn tray menu: placement, per-monitor DPI, light and dark colors, high contrast, names for screen readers. |
+| `GsyncLogic.h` | Pure logic, without Windows: states, command-line parsing, what a click, the menu or a command must do, the five setting values, exit codes, display model codes and profile names, grouping and matching of display models, the `/list` text and the tray tooltip. |
+| `GsyncCore.h` | NVAPI and display work, shared by the tray and the command line: the machine-wide lock, reading and saving the NVIDIA global profile, waiting for the display, the redraw and the refresh-rate check, reading the displays and saving and applying the choice for a display model. |
+| `TrayMenu.h` | The owner-drawn tray menu: placement, per-monitor DPI, light and dark colors, high contrast, separators and section title, menu keys, names for screen readers. |
 | `GsyncStatusTrayToggle.cpp` | Entry point, tray icon, menu commands, settings, the watcher and command threads. |
 | `tests/GsyncLogicTests.cpp` | Console test runner for `GsyncLogic.h`, no test framework. Exit code 0 when every check passes. |
 | `nvapi/` | NVIDIA NVAPI headers and library, unchanged. |
@@ -18,15 +18,16 @@ How the code is organized, for anyone who maintains it. Comments in the code exp
 | Thread | Owns |
 | --- | --- |
 | UI thread | Window, tray icon, menu, settings, Start with Windows. It never calls NVAPI and never waits for the display. |
-| Watcher thread | Watches the NVIDIA settings folder, reads the state through NVAPI and posts it to the UI thread. It holds one NVAPI reference for the life of the tray. |
-| Command thread | Runs one G-SYNC change (`Execute`) and posts the result. |
-| System thread pool | Monitor removal and arrival callbacks (`ReturnWatch`) during a change. |
+| Watcher thread | Watches the NVIDIA settings folder and display changes, reads the state and the displays through NVAPI and posts them to the UI thread. It holds one NVAPI reference for the life of the tray. |
+| Command thread | Runs one G-SYNC change (`Execute`) or one display choice (`ChooseForDisplay`) and posts the result. |
+| System thread pool | Monitor removal and arrival callbacks: `ReturnWatch` during a change, and `MonitorChanged` for the life of the tray. |
 
 Rules that keep this safe:
 
 - The UI thread starts a command only when none is running, and reads the result after the thread has ended.
 - NVAPI is called from one thread at a time (`g_nvapi`), because its thread safety is not documented.
-- One G-SYNC change at a time across all processes: `Global\GsyncToggleMutex` is held for the whole change, by the tray and by `/off`, `/fs` and `/fsw`.
+- One G-SYNC change at a time across all processes: `Global\GsyncToggleMutex` is held for the whole change, by the tray and by `/off`, `/fs`, `/fsw`, `/allow` and `/disallow`.
+- The display list read by the watcher thread is copied under `g_displayData`. The menu works on its own copy, taken when it opens.
 - Nothing that can block, such as NVAPI or a wait for the display, runs on the UI thread.
 
 ## From a click to G-SYNC
@@ -41,9 +42,21 @@ Rules that keep this safe:
 
 A change takes about 3.5 seconds and the screen blinks once.
 
+## Allow G-SYNC on a display
+
+This is the NVIDIA Control Panel's **Enable settings for the selected display model**, reproduced exactly so each side shows the other's change.
+
+1. **Read the displays** (`ReadTargets`): every active path on an NVIDIA GPU with EDID IDs, its NVAPI display ID, its adaptive sync data and its monitor capabilities. `supportVRR` tells whether VRR is on in the monitor's own menu; `currentlyCapableOfVRR` is not used because it also follows the choice. Identical displays are grouped into one model (`GroupModels`).
+2. **Find the model** (`MatchModels`): the Windows display name or the model code, such as `SAM713F`, case-insensitive. No match returns 30, more than one returns 31.
+3. **Refuse while G-SYNC is off** (32): NVIDIA rejects the change then, and the Control Panel grays the option out.
+4. **Save** (`SaveModelChoice`): the profile `0xMMMM:0xPPPP` from the EDID manufacturer and product codes, the application of the same name in lower case with the profile name as friendly name, `0x106D5CFF` = 1 to hide the profile, and `0x1194F158` = 1 or 0. Nothing is saved unless every step succeeds.
+5. **Apply** (`ApplyModelChoice`): the driver reads the profile only when the display reconnects, so `NvAPI_DISP_SetAdaptiveSyncData` applies the choice to each display of the model that offers VRR. This can itself reconnect the display, depending on the display and the direction, so the result is checked only once the display is back.
+
+A display whose VRR is off in its own menu keeps only the saved choice. When VRR is turned on there, the display reconnects, and the driver reconnects it once more about 1.5 seconds later to apply the saved choice. That second reconnect changes no display mode, so Windows sends no `WM_DISPLAYCHANGE`: the tray also listens to monitor arrivals and removals, and reads the displays one second after the last one.
+
 ## Icon state
 
-The icon shows Application Mode from the global profile. The watcher thread waits until NVIDIA rewrites `nvdrsdb0.bin`, `nvdrsdb1.bin` or `nvdrssel.bin` in `%ProgramData%\NVIDIA Corporation\Drs`, which every program does when it saves NVIDIA settings, then reads the profile 250 ms after the last write. It also reads it when the menu opens and after each command. No administrator rights are needed: the driver's registry key is not used.
+The icon shows Application Mode from the global profile. While G-SYNC is on, the tooltip also names each display that offers VRR but does not allow G-SYNC. The watcher thread waits until NVIDIA rewrites `nvdrsdb0.bin`, `nvdrsdb1.bin` or `nvdrssel.bin` in `%ProgramData%\NVIDIA Corporation\Drs`, which every program does when it saves NVIDIA settings, then reads the profile 250 ms after the last write. It also reads it when the menu opens and after each command. No administrator rights are needed: the driver's registry key is not used.
 
 ## Settings
 
@@ -52,8 +65,10 @@ The icon shows Application Mode from the global profile. The watcher thread wait
 
 ## Command line
 
-`/off`, `/fs` and `/fsw` run one change without the tray and return an exit code, listed in the README and in `GsyncLogic.h`. Any other argument returns 64. The command line shows no message, so scripts never wait on a dialog.
+`/off`, `/fs`, `/fsw`, `/allow NAME` and `/disallow NAME` run one change without the tray and return an exit code, listed in the README and in `GsyncLogic.h`. Any other argument returns 64. The command line shows no message, so scripts never wait on a dialog.
+
+`/list` writes a table to the redirected output, or else to the console of the command prompt that started it. The program stays windowed so the tray never opens a console; the cost is that an interactive prompt does not wait for it, hence `| more` in the README.
 
 ## Tests
 
-`GsyncLogicTests.exe` checks the command-line parsing, the five values of each plan, every click, menu and command decision, the exit code values and the names of the watched files. The README commands and GitHub Actions build and run it before the app.
+`GsyncLogicTests.exe` checks the command-line parsing, the five values of each plan, every click, menu and command decision, the exit code values, the names of the watched files, the model codes and profile names, the grouping and matching of display models, the `/list` text and the tooltip. The README commands and GitHub Actions build and run it before the app.

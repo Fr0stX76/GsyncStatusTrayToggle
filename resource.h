@@ -1,8 +1,8 @@
 #pragma once
 
-#define APP_VERSION         1, 1, 0, 0
-#define APP_VERSION_TEXT    "1.1.0.0"
-#define APP_PRODUCT_VERSION "1.1.0"
+#define APP_VERSION         1, 2, 0, 0
+#define APP_VERSION_TEXT    "1.2.0.0"
+#define APP_PRODUCT_VERSION "1.2.0"
 #define APP_FILE_FLAGS      0x0L
 
 #define IDI_ICON_FULLSCREEN    101
@@ -16,3 +16,5 @@
 #define ID_TRAY_FULLSCREEN 40002
 #define ID_TRAY_WINDOWED   40003
 #define ID_TRAY_STARTUP    40004
+#define ID_TRAY_DISPLAYS   40005
+#define ID_TRAY_DISPLAY    40100

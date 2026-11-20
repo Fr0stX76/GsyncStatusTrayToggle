@@ -7,6 +7,7 @@
 #include <initializer_list>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace gsync
 {
@@ -32,6 +33,9 @@ enum class Action
     Toggle,
     SelectFullscreen,
     SelectWindowed,
+    Allow,
+    Disallow,
+    List,
     Invalid
 };
 
@@ -50,6 +54,10 @@ enum class ExitCode : int
     NvidiaSave = 16,
     Verification = 17,
     InternalError = 20,
+    DisplayNotFound = 30,
+    DisplayAmbiguous = 31,
+    GsyncOff = 32,
+    DisplayRefused = 33,
     Arguments = 64
 };
 
@@ -207,20 +215,190 @@ inline bool ParseMode(const std::wstring& text, Mode& mode)
     return false;
 }
 
-inline Action ParseArguments(int argc, const wchar_t* const* argv)
+struct Command
 {
+    Action action = Action::Invalid;
+    std::wstring display;
+};
+
+inline Command ParseCommand(int argc, const wchar_t* const* argv)
+{
+    Command command;
     if (argc == 1)
-        return Action::Tray;
-    if (argc != 2)
-        return Action::Invalid;
+    {
+        command.action = Action::Tray;
+        return command;
+    }
+    if (argc != 2 && argc != 3)
+        return command;
     const std::wstring arg = Lower(argv[1]);
+    if (argc == 3)
+    {
+        if ((arg == L"/allow" || arg == L"/disallow") && argv[2][0] != L'\0')
+        {
+            command.action = arg == L"/allow" ? Action::Allow : Action::Disallow;
+            command.display = argv[2];
+        }
+        return command;
+    }
     if (arg == L"/off")
-        return Action::Off;
-    if (arg == L"/fs")
-        return Action::Fullscreen;
-    if (arg == L"/fsw")
-        return Action::Windowed;
-    return Action::Invalid;
+        command.action = Action::Off;
+    else if (arg == L"/fs")
+        command.action = Action::Fullscreen;
+    else if (arg == L"/fsw")
+        command.action = Action::Windowed;
+    else if (arg == L"/list")
+        command.action = Action::List;
+    return command;
+}
+
+// NVIDIA keeps one choice per EDID manufacturer and product code, so identical displays are grouped into one model.
+struct DisplayModel
+{
+    std::wstring name;
+    std::uint16_t manufacturer = 0;
+    std::uint16_t product = 0;
+    bool vrr = false;
+    bool allowed = false;
+};
+
+inline bool SameModel(const DisplayModel& a, const DisplayModel& b)
+{
+    return a.manufacturer == b.manufacturer && a.product == b.product;
+}
+
+inline std::wstring Hex4(std::uint16_t value)
+{
+    std::wstring text;
+    for (const unsigned shift : {12u, 8u, 4u, 0u})
+        text.push_back(L"0123456789ABCDEF"[(value >> shift) & 0xFu]);
+    return text;
+}
+
+// Windows reports the EDID manufacturer bytes swapped. The three letters take five bits each, 1 for A.
+inline std::wstring ModelCode(std::uint16_t manufacturer, std::uint16_t product)
+{
+    const unsigned packed = ((manufacturer & 0xFFu) << 8) | (manufacturer >> 8);
+    std::wstring code;
+    for (const unsigned shift : {10u, 5u, 0u})
+    {
+        const unsigned letter = (packed >> shift) & 0x1Fu;
+        code.push_back(letter >= 1 && letter <= 26 ? static_cast<wchar_t>(L'A' + letter - 1) : L'?');
+    }
+    return code + Hex4(product);
+}
+
+inline std::wstring ModelCode(const DisplayModel& model)
+{
+    return ModelCode(model.manufacturer, model.product);
+}
+
+// The NVIDIA Control Panel keeps the choice for a display model in a hidden profile with this name, and attaches
+// to it an application with the same name in lower case.
+inline std::wstring ProfileName(const DisplayModel& model)
+{
+    return L"0x" + Hex4(model.manufacturer) + L":0x" + Hex4(model.product);
+}
+
+inline std::wstring ApplicationName(const DisplayModel& model)
+{
+    return Lower(ProfileName(model));
+}
+
+inline std::vector<DisplayModel> GroupModels(const std::vector<DisplayModel>& displays)
+{
+    std::vector<DisplayModel> models;
+    for (const DisplayModel& display : displays)
+    {
+        const auto same = std::find_if(models.begin(), models.end(),
+                                       [&display](const DisplayModel& model) { return SameModel(model, display); });
+        if (same == models.end())
+        {
+            models.push_back(display);
+            continue;
+        }
+        // Identical displays share one NVIDIA profile. The model counts as allowed only when every display that
+        // offers VRR allows G-SYNC; displays without VRR count only when none offers it.
+        if (display.vrr && !same->vrr)
+            same->allowed = display.allowed;
+        else if (display.vrr == same->vrr)
+            same->allowed = same->allowed && display.allowed;
+        same->vrr = same->vrr || display.vrr;
+        if (same->name.empty())
+            same->name = display.name;
+    }
+    return models;
+}
+
+inline std::vector<std::size_t> MatchModels(const std::vector<DisplayModel>& models, std::wstring_view wanted)
+{
+    std::vector<std::size_t> found;
+    for (std::size_t i = 0; i < models.size(); ++i)
+        if (SameTextIgnoringCase(models[i].name, wanted) || SameTextIgnoringCase(ModelCode(models[i]), wanted))
+            found.push_back(i);
+    return found;
+}
+
+inline std::wstring ModelLabel(const std::vector<DisplayModel>& models, std::size_t index)
+{
+    const DisplayModel& model = models[index];
+    if (model.name.empty())
+        return ModelCode(model);
+    for (std::size_t i = 0; i < models.size(); ++i)
+        if (i != index && SameTextIgnoringCase(models[i].name, model.name))
+            return model.name + L" (" + ModelCode(model) + L")";
+    return model.name;
+}
+
+inline std::wstring ListText(const std::vector<DisplayModel>& models)
+{
+    if (models.empty())
+        return L"No active NVIDIA display.\r\n";
+    struct Row
+    {
+        std::wstring name, code, gsync, vrr;
+    };
+    std::vector<Row> rows = {{L"Display", L"Model", L"G-SYNC", L"VRR"}};
+    for (std::size_t i = 0; i < models.size(); ++i)
+        rows.push_back({ModelLabel(models, i), ModelCode(models[i]), models[i].allowed ? L"allowed" : L"not allowed",
+                        models[i].vrr ? L"available" : L"not available"});
+    std::size_t nameWidth = 0, codeWidth = 0, gsyncWidth = 0;
+    for (const Row& row : rows)
+    {
+        nameWidth = (std::max)(nameWidth, row.name.size());
+        codeWidth = (std::max)(codeWidth, row.code.size());
+        gsyncWidth = (std::max)(gsyncWidth, row.gsync.size());
+    }
+    std::wstring text;
+    for (const Row& row : rows)
+    {
+        text += row.name + std::wstring(nameWidth - row.name.size() + 2, L' ');
+        text += row.code + std::wstring(codeWidth - row.code.size() + 2, L' ');
+        text += row.gsync + std::wstring(gsyncWidth - row.gsync.size() + 2, L' ');
+        text += row.vrr + L"\r\n";
+    }
+    return text;
+}
+
+constexpr std::size_t TrayTipLength = 127;
+
+inline std::wstring TrayTip(State state, const std::vector<DisplayModel>& models)
+{
+    std::wstring tip = state == State::Off          ? L"G-SYNC Off"
+                       : state == State::Fullscreen ? L"G-SYNC Fullscreen"
+                       : state == State::Windowed   ? L"G-SYNC Fullscreen + Windowed"
+                                                    : L"G-SYNC Unknown";
+    if (!IsOn(state))
+        return tip;
+    std::wstring blocked;
+    for (std::size_t i = 0; i < models.size(); ++i)
+        if (models[i].vrr && !models[i].allowed)
+            blocked += (blocked.empty() ? L"" : L", ") + ModelLabel(models, i);
+    if (!blocked.empty())
+        tip += L"\nNot allowed on " + blocked;
+    if (tip.size() > TrayTipLength)
+        tip = tip.substr(0, TrayTipLength - 3) + L"...";
+    return tip;
 }
 
 }

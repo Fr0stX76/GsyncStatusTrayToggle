@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <iterator>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -33,6 +35,11 @@ static_assert(SettingDefaults[GlobalMode] == static_cast<std::uint32_t>(VRRREQUE
 static_assert(SettingDefaults[PreferredRefresh] == static_cast<std::uint32_t>(REFRESH_RATE_OVERRIDE_DEFAULT),
               "Preferred Refreshrate default");
 
+// In a display model profile, the Application Mode setting holds the choice for that model: 1 allowed, 0 not.
+inline constexpr NvU32 ModelChoiceSetting = static_cast<NvU32>(VRR_MODE_ID);
+inline constexpr NvU32 HiddenProfileSetting = static_cast<NvU32>(CPL_HIDDEN_PROFILE_ID);
+static_assert(HiddenProfileSetting == 0x106D5CFFu, "Hidden profile ID");
+
 inline constexpr wchar_t MutexName[] = L"Global\\GsyncToggleMutex";
 inline constexpr DWORD MutexTimeout = 15000;
 inline constexpr DWORD ModesetWait = 1500;
@@ -42,12 +49,15 @@ inline constexpr DWORD ReturnTimeout = 4000;
 inline constexpr DWORD ReturnSettle = 600;
 inline constexpr DWORD RateWatch = 2500;
 inline constexpr DWORD PollWait = 50;
+inline constexpr DWORD ChoiceTimeout = 2000;
 
 inline constexpr GUID MonitorInterface = {
     0xE6F07B5Fu, 0xEE97u, 0x4A90u, {0xB0u, 0x76u, 0x33u, 0xF5u, 0x7Bu, 0xF4u, 0xEAu, 0xA7u}};
 inline constexpr wchar_t PartialChange[] =
     L"Part of the change was saved, then NVIDIA refused the rest. Set G-SYNC in the NVIDIA Control Panel.";
 inline constexpr wchar_t LockOpenFailed[] = L"The G-SYNC lock could not be opened. Try again.";
+inline constexpr wchar_t NvapiMissing[] = L"NVAPI could not be initialized. Check that the NVIDIA driver is installed.";
+inline constexpr wchar_t ChoiceRejected[] = L"NVIDIA rejected the display choice. Nothing was changed.";
 
 struct Result
 {
@@ -184,8 +194,7 @@ public:
     {
         NvAPI_Status s = NvAPI_Initialize();
         if (s != NVAPI_OK)
-            return Failure(ExitCode::NvidiaInitialize,
-                           L"NVAPI could not be initialized. Check that the NVIDIA driver is installed.", s);
+            return Failure(ExitCode::NvidiaInitialize, NvapiMissing, s);
         initialized_ = true;
         s = NvAPI_DRS_CreateSession(&session);
         if (s != NVAPI_OK)
@@ -550,6 +559,350 @@ inline Result Execute(Action action, Mode preference = Mode::Fullscreen)
         result.error = L"G-SYNC was changed, but Windows could not redraw the displays. "
                        L"If a display stays black or at a lower refresh rate, turn it off and back on.";
     }
+    return result;
+}
+
+class NvapiScope final
+{
+    bool loaded_ = false;
+
+public:
+    NvapiScope() = default;
+    NvapiScope(const NvapiScope&) = delete;
+    NvapiScope& operator=(const NvapiScope&) = delete;
+
+    ~NvapiScope()
+    {
+        if (loaded_)
+            NvAPI_Unload();
+    }
+
+    Result Open()
+    {
+        const NvAPI_Status s = NvAPI_Initialize();
+        if (s != NVAPI_OK)
+            return Failure(ExitCode::NvidiaInitialize, NvapiMissing, s);
+        loaded_ = true;
+        return {};
+    }
+};
+
+struct DisplayTarget
+{
+    NvU32 id = 0;
+    DisplayModel model;
+    NV_GET_ADAPTIVE_SYNC_DATA sync{};
+};
+
+inline bool ReadSync(NvU32 id, NV_GET_ADAPTIVE_SYNC_DATA& sync)
+{
+    sync = {};
+    sync.version = NV_GET_ADAPTIVE_SYNC_DATA_VER;
+    return NvAPI_DISP_GetAdaptiveSyncData(id, &sync) == NVAPI_OK;
+}
+
+// A display whose EDID IDs or NVIDIA data cannot be read is left out: no model profile can be named for it.
+inline bool Describe(const DISPLAYCONFIG_PATH_INFO& path, DisplayTarget& target)
+{
+    DISPLAYCONFIG_TARGET_DEVICE_NAME monitor{};
+    monitor.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    monitor.header.size = sizeof(monitor);
+    monitor.header.adapterId = path.targetInfo.adapterId;
+    monitor.header.id = path.targetInfo.id;
+    if (DisplayConfigGetDeviceInfo(&monitor.header) != ERROR_SUCCESS || !monitor.flags.edidIdsValid)
+        return false;
+
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+    source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+    source.header.size = sizeof(source);
+    source.header.adapterId = path.sourceInfo.adapterId;
+    source.header.id = path.sourceInfo.id;
+    char gdiName[CCHDEVICENAME]{};
+    if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
+        !WideCharToMultiByte(CP_ACP, 0, source.viewGdiDeviceName, -1, gdiName, static_cast<int>(sizeof(gdiName)),
+                             nullptr, nullptr) ||
+        NvAPI_DISP_GetDisplayIdByDisplayName(gdiName, &target.id) != NVAPI_OK || !ReadSync(target.id, target.sync))
+        return false;
+
+    // supportVRR follows the VRR switch in the monitor's own menu. currentlyCapableOfVRR also follows the choice
+    // made here, so it cannot tell whether the display belongs in the list.
+    NV_MONITOR_CAPABILITIES caps{};
+    caps.version = NV_MONITOR_CAPABILITIES_VER;
+    caps.size = static_cast<NvU16>(sizeof(caps));
+    caps.infoType = NV_MONITOR_CAPS_TYPE_GENERIC;
+    target.model.vrr = NvAPI_DISP_GetMonitorCapabilities(target.id, &caps) == NVAPI_OK && caps.bIsValidInfo &&
+                       caps.data.caps.supportVRR;
+    target.model.name = monitor.monitorFriendlyDeviceName;
+    target.model.manufacturer = monitor.edidManufactureId;
+    target.model.product = monitor.edidProductCodeId;
+    target.model.allowed = !target.sync.bDisableAdaptiveSync;
+    return true;
+}
+
+inline bool ReadTargets(std::vector<DisplayTarget>& targets)
+{
+    targets.clear();
+    DisplayConfig config;
+    if (!config.Query())
+        return false;
+    for (const DISPLAYCONFIG_PATH_INFO& path : config.paths)
+    {
+        DisplayTarget target;
+        // Cloned displays share one source, so NVAPI returns the same display ID for each of them.
+        if (IsNvidia(path) && Describe(path, target) &&
+            std::none_of(targets.begin(), targets.end(),
+                         [&target](const DisplayTarget& known) { return known.id == target.id; }))
+            targets.push_back(std::move(target));
+    }
+    return true;
+}
+
+inline std::vector<DisplayModel> ModelsOf(const std::vector<DisplayTarget>& targets)
+{
+    std::vector<DisplayModel> displays;
+    for (const DisplayTarget& target : targets)
+        displays.push_back(target.model);
+    return GroupModels(displays);
+}
+
+// The caller keeps NVAPI loaded.
+inline bool ReadModels(std::vector<DisplayModel>& models)
+{
+    std::vector<DisplayTarget> targets;
+    if (!ReadTargets(targets))
+        return false;
+    models = ModelsOf(targets);
+    return true;
+}
+
+inline Result ListModels(std::vector<DisplayModel>& models)
+{
+    NvapiScope nvapi;
+    Result result = nvapi.Open();
+    if (result.code != ExitCode::Success)
+        return result;
+    if (!ReadModels(models))
+        return Failure(ExitCode::DisplayRefused, L"The active displays could not be read.");
+    if (models.empty())
+        return Failure(ExitCode::DisplayNotFound, L"No active NVIDIA display.");
+    return result;
+}
+
+inline void ToUnicode(const std::wstring& text, NvAPI_UnicodeString& out)
+{
+    std::fill(std::begin(out), std::end(out), static_cast<NvU16>(0));
+    const std::size_t length = (std::min)(text.size(), std::size(out) - 1);
+    for (std::size_t i = 0; i < length; ++i)
+        out[i] = static_cast<NvU16>(text[i]);
+}
+
+// NvAPI_DRS_GetSetting also returns values inherited from the global profile, so only a value stored in this
+// profile counts.
+inline bool HoldsDword(NvDRSSessionHandle session, NvDRSProfileHandle profile, NvU32 id, NvU32 value)
+{
+    NVDRS_SETTING setting{};
+    setting.version = NVDRS_SETTING_VER;
+    return NvAPI_DRS_GetSetting(session, profile, id, &setting) == NVAPI_OK &&
+           setting.settingLocation == NVDRS_CURRENT_PROFILE_LOCATION && setting.settingType == NVDRS_DWORD_TYPE &&
+           setting.u32CurrentValue == value;
+}
+
+inline NvAPI_Status WriteDword(NvDRSSessionHandle session, NvDRSProfileHandle profile, NvU32 id, NvU32 value)
+{
+    NVDRS_SETTING setting{};
+    setting.version = NVDRS_SETTING_VER;
+    setting.settingId = id;
+    setting.settingType = NVDRS_DWORD_TYPE;
+    setting.u32CurrentValue = value;
+    return NvAPI_DRS_SetSetting(session, profile, &setting);
+}
+
+inline NvAPI_Status CreateModelProfile(NvDRSSessionHandle session, const DisplayModel& model,
+                                       NvDRSProfileHandle& profile)
+{
+    NVDRS_PROFILE info{};
+    info.version = NVDRS_PROFILE_VER;
+    ToUnicode(ProfileName(model), info.profileName);
+    return NvAPI_DRS_CreateProfile(session, &info, &profile);
+}
+
+inline NvAPI_Status AddModelApplication(NvDRSSessionHandle session, NvDRSProfileHandle profile,
+                                        const DisplayModel& model, bool& added)
+{
+    NvAPI_UnicodeString name{};
+    ToUnicode(ApplicationName(model), name);
+    // Each NVDRS_APPLICATION holds four 4 KB strings, so it is zeroed on the heap rather than on the stack.
+    const auto found = std::make_unique<NVDRS_APPLICATION>();
+    found->version = NVDRS_APPLICATION_VER;
+    const NvAPI_Status s = NvAPI_DRS_GetApplicationInfo(session, profile, name, found.get());
+    if (s != NVAPI_EXECUTABLE_NOT_FOUND)
+        return s;
+
+    const auto application = std::make_unique<NVDRS_APPLICATION>();
+    application->version = NVDRS_APPLICATION_VER;
+    ToUnicode(ApplicationName(model), application->appName);
+    ToUnicode(ProfileName(model), application->userFriendlyName);
+    const NvAPI_Status created = NvAPI_DRS_CreateApplication(session, profile, application.get());
+    added = created == NVAPI_OK;
+    return created;
+}
+
+// The same profile as the NVIDIA Control Panel's: hidden from its program list, with one application named after
+// the profile, so the Control Panel shows and edits this choice as its own. Nothing reaches the NVIDIA settings
+// unless every step succeeds, since only NvAPI_DRS_SaveSettings stores the session.
+inline Result SaveModelChoice(const DrsSession& drs, const DisplayModel& model, bool allow)
+{
+    NvAPI_UnicodeString name{};
+    ToUnicode(ProfileName(model), name);
+    NvDRSProfileHandle profile = nullptr;
+    bool changed = false;
+    NvAPI_Status s = NvAPI_DRS_FindProfileByName(drs.session, name, &profile);
+    if (s == NVAPI_PROFILE_NOT_FOUND)
+    {
+        s = CreateModelProfile(drs.session, model, profile);
+        changed = true;
+    }
+    if (s != NVAPI_OK)
+        return Failure(ExitCode::NvidiaSetting, ChoiceRejected, s);
+
+    bool added = false;
+    s = AddModelApplication(drs.session, profile, model, added);
+    if (s == NVAPI_EXECUTABLE_ALREADY_IN_USE)
+        return Failure(ExitCode::NvidiaSetting, (L"Another NVIDIA profile already uses the application " +
+                                                 ApplicationName(model) + L". Nothing was changed.")
+                                                    .c_str());
+    if (s != NVAPI_OK)
+        return Failure(ExitCode::NvidiaSetting, ChoiceRejected, s);
+    changed = changed || added;
+
+    struct Wanted
+    {
+        NvU32 id;
+        NvU32 value;
+    };
+    for (const Wanted wanted : {Wanted{HiddenProfileSetting, 1u}, Wanted{ModelChoiceSetting, allow ? 1u : 0u}})
+    {
+        if (HoldsDword(drs.session, profile, wanted.id, wanted.value))
+            continue;
+        s = WriteDword(drs.session, profile, wanted.id, wanted.value);
+        if (s != NVAPI_OK)
+            return Failure(ExitCode::NvidiaSetting, ChoiceRejected, s);
+        changed = true;
+    }
+    if (!changed)
+        return {};
+    s = NvAPI_DRS_SaveSettings(drs.session);
+    if (s != NVAPI_OK)
+        return Failure(ExitCode::NvidiaSave, L"The NVIDIA settings could not be saved. Nothing was changed.", s);
+    return {};
+}
+
+inline bool ModelShows(const std::vector<DisplayTarget>& targets, const DisplayModel& model, NvU32 disabled)
+{
+    for (const DisplayTarget& target : targets)
+    {
+        NV_GET_ADAPTIVE_SYNC_DATA sync{};
+        if (SameModel(target.model, model) && target.model.vrr &&
+            (!ReadSync(target.id, sync) || sync.bDisableAdaptiveSync != disabled))
+            return false;
+    }
+    return true;
+}
+
+// The driver reads a saved choice only when the display reconnects, so the choice is also applied to each display
+// now, as the Control Panel does. Applying it can itself reconnect the display, and a value read during the
+// reconnect is the old one, so the check waits until the display is back.
+inline Result ApplyModelChoice(const std::vector<DisplayTarget>& targets, const DisplayModel& model, bool allow)
+{
+    const NvU32 disabled = allow ? 0u : 1u;
+    DisplayConfig config;
+    static_cast<void>(config.Query());
+    const ReturnWatch watch(config);
+    bool changed = false;
+    for (const DisplayTarget& target : targets)
+    {
+        if (!SameModel(target.model, model) || !target.model.vrr || target.sync.bDisableAdaptiveSync == disabled)
+            continue;
+        // Set replaces every field, so the values just read are sent back and only the choice changes.
+        NV_SET_ADAPTIVE_SYNC_DATA set{};
+        set.version = NV_SET_ADAPTIVE_SYNC_DATA_VER;
+        set.maxFrameInterval = target.sync.maxFrameInterval;
+        set.maxFrameIntervalNs = static_cast<NvU64>(target.sync.maxFrameInterval) * 1000u;
+        set.bDisableAdaptiveSync = disabled;
+        set.bDisableFrameSplitting = target.sync.bDisableFrameSplitting;
+        const NvAPI_Status s = NvAPI_DISP_SetAdaptiveSyncData(target.id, &set);
+        if (s != NVAPI_OK)
+            return Failure(ExitCode::DisplayRefused,
+                           L"The choice was saved, but NVIDIA could not apply it to the display now.", s);
+        changed = true;
+    }
+    if (!changed)
+        return {};
+
+    if (watch.Removed(RemovalWait))
+    {
+        const ULONGLONG back = GetTickCount64() + ReturnTimeout;
+        watch.Arrived(ReturnTimeout);
+        while (!Present(config) && GetTickCount64() < back)
+            Sleep(PollWait);
+        Sleep(ReturnSettle);
+    }
+    const ULONGLONG until = GetTickCount64() + ChoiceTimeout;
+    while (!ModelShows(targets, model, disabled))
+    {
+        if (GetTickCount64() >= until)
+            return Failure(ExitCode::Verification, L"The choice was saved, but the display did not confirm it. "
+                                                   L"Check the option in the NVIDIA Control Panel.");
+        Sleep(PollWait);
+    }
+    return {};
+}
+
+inline Result ChooseModel(const DrsSession& drs, const std::wstring& wanted, bool allow)
+{
+    std::vector<DisplayTarget> targets;
+    if (!ReadTargets(targets))
+        return Failure(ExitCode::DisplayRefused, L"The active displays could not be read. Nothing was changed.");
+    const std::vector<DisplayModel> models = ModelsOf(targets);
+    const std::vector<std::size_t> found = MatchModels(models, wanted);
+    if (found.empty())
+        return Failure(ExitCode::DisplayNotFound,
+                       (L"No active NVIDIA display is named " + wanted + L". Nothing was changed.").c_str());
+    if (found.size() > 1)
+        return Failure(ExitCode::DisplayAmbiguous, (L"Several display models are named " + wanted +
+                                                    L". Use the model code shown by /list. Nothing was changed.")
+                                                       .c_str());
+    const DisplayModel& model = models[found.front()];
+    const Result saved = SaveModelChoice(drs, model, allow);
+    if (saved.code != ExitCode::Success)
+        return saved;
+    return ApplyModelChoice(targets, model, allow);
+}
+
+inline Result ChooseForDisplay(const std::wstring& wanted, bool allow)
+{
+    ToggleLock lock;
+    Result result = lock.Acquire();
+    if (result.code != ExitCode::Success)
+        return result;
+    DrsSession drs;
+    result = drs.Open();
+    if (result.code != ExitCode::Success)
+        return result;
+    Values values{};
+    result = ReadValues(drs, values);
+    if (result.code != ExitCode::Success)
+        return result;
+
+    const State state = DecodeState(values[ApplicationMode]);
+    if (state == State::Unknown)
+        return Failure(ExitCode::StateUnknown, L"Application Mode (Enable G-SYNC globally) has an unknown value. "
+                                               L"Nothing was changed.");
+    // NVIDIA refuses the change while G-SYNC is off, and the Control Panel grays the option out.
+    result = state == State::Off ? Failure(ExitCode::GsyncOff, L"G-SYNC is off. Turn it on, then allow or disallow "
+                                                               L"the display again. Nothing was changed.")
+                                 : ChooseModel(drs, wanted, allow);
+    result.state = state;
     return result;
 }
 

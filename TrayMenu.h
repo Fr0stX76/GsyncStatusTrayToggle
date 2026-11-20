@@ -6,6 +6,7 @@
 #include <dwmapi.h>
 #include <algorithm>
 #include <cwchar>
+#include <cwctype>
 #include <iterator>
 
 namespace traymenu
@@ -21,12 +22,57 @@ inline bool TaskbarIsLight()
     return rc == ERROR_SUCCESS && light != 0;
 }
 
+enum class Kind
+{
+    Command,
+    Title,
+    Separator
+};
+
 struct Item
 {
-    UINT id;
-    const wchar_t* text;
+    // Screen readers find MSAAMENUINFO at the start of the item data, so it stays the first member.
     MSAAMENUINFO accessible{};
+    UINT id = 0;
+    const wchar_t* text = L"";
+    Kind kind = Kind::Command;
 };
+
+inline Item MakeItem(UINT id, const wchar_t* text, Kind kind = Kind::Command)
+{
+    Item item;
+    item.id = id;
+    item.text = text;
+    item.kind = kind;
+    return item;
+}
+
+// Windows does not match typed letters to owner-drawn items, so this does it as a standard menu would for items
+// without an underlined letter.
+inline LRESULT MenuKey(HMENU menu, const Item* items, std::size_t count, wchar_t typed)
+{
+    const std::wint_t key = std::towupper(static_cast<std::wint_t>(typed));
+    int first = -1, next = -1, current = -1, matches = 0;
+    for (std::size_t i = 0; i < count; ++i)
+        if (GetMenuState(menu, static_cast<UINT>(i), MF_BYPOSITION) & MF_HILITE)
+            current = static_cast<int>(i);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const UINT state = GetMenuState(menu, static_cast<UINT>(i), MF_BYPOSITION);
+        if (items[i].kind != Kind::Command || (state & (MF_GRAYED | MF_DISABLED)) ||
+            key != std::towupper(static_cast<std::wint_t>(items[i].text[0])))
+            continue;
+        const int position = static_cast<int>(i);
+        if (first < 0)
+            first = position;
+        if (position > current && next < 0)
+            next = position;
+        ++matches;
+    }
+    if (!matches)
+        return MAKELRESULT(0, MNC_IGNORE);
+    return MAKELRESULT(next < 0 ? first : next, matches == 1 ? MNC_EXECUTE : MNC_SELECT);
+}
 
 struct Placement
 {
@@ -108,8 +154,8 @@ class Visual
     HBRUSH backgroundBrush_ = nullptr;
     HWND menuWindow_ = nullptr;
     int dpi_ = 96;
-    COLORREF background_ = 0, foreground_ = 0, highlight_ = 0, selectedText_ = 0, disabledText_ = 0;
-    UINT width_ = 0, height_ = 0;
+    COLORREF background_ = 0, foreground_ = 0, highlight_ = 0, selectedText_ = 0, disabledText_ = 0, line_ = 0;
+    UINT width_ = 0, height_ = 0, separatorHeight_ = 0;
     DWORD error_ = ERROR_SUCCESS;
     int Scale(int value) const
     {
@@ -150,6 +196,7 @@ public:
         highlight_ = highContrast ? GetSysColor(COLOR_HIGHLIGHT) : dark ? RGB(55, 55, 55) : RGB(230, 230, 230);
         selectedText_ = highContrast ? GetSysColor(COLOR_HIGHLIGHTTEXT) : foreground_;
         disabledText_ = highContrast ? GetSysColor(COLOR_GRAYTEXT) : dark ? RGB(140, 140, 140) : RGB(118, 118, 118);
+        line_ = highContrast ? GetSysColor(COLOR_GRAYTEXT) : dark ? RGB(64, 64, 64) : RGB(215, 215, 215);
 
         backgroundBrush_ = CreateSolidBrush(background_);
         NONCLIENTMETRICSW metrics{};
@@ -184,6 +231,7 @@ public:
 
         width_ = static_cast<UINT>(textWidth + Scale(40));
         height_ = static_cast<UINT>((std::max)(static_cast<int>(textHeight) + Scale(10), Scale(28)));
+        separatorHeight_ = static_cast<UINT>(Scale(9));
 
         MENUINFO info{};
         info.cbSize = sizeof(info);
@@ -196,15 +244,19 @@ public:
         for (std::size_t i = 0; i < count; ++i)
         {
             Item& item = items[i];
+            const bool separator = item.kind == Kind::Separator;
             item.accessible = {MSAA_MENU_SIG, static_cast<DWORD>(lstrlenW(item.text)), const_cast<LPWSTR>(item.text)};
-            if (!AppendMenuW(menu, MF_STRING, item.id, item.text))
+            if (!AppendMenuW(menu, static_cast<UINT>(separator ? MF_SEPARATOR : MF_STRING), item.id,
+                             separator ? nullptr : item.text))
                 return Fail();
+            // A system-drawn separator ignores the menu colors, so separators are drawn like the other items.
             MENUITEMINFOW entry{};
             entry.cbSize = sizeof(entry);
-            entry.fMask = MIIM_FTYPE | MIIM_DATA;
-            entry.fType = MFT_OWNERDRAW;
-            entry.dwItemData = reinterpret_cast<ULONG_PTR>(&item.accessible);
-            if (!SetMenuItemInfoW(menu, item.id, FALSE, &entry))
+            entry.fMask = MIIM_FTYPE | MIIM_DATA | MIIM_STATE;
+            entry.fType = static_cast<UINT>(MFT_OWNERDRAW | (separator ? MFT_SEPARATOR : 0));
+            entry.fState = static_cast<UINT>(item.kind == Kind::Title ? MFS_DISABLED : MFS_ENABLED);
+            entry.dwItemData = reinterpret_cast<ULONG_PTR>(&item);
+            if (!SetMenuItemInfoW(menu, static_cast<UINT>(i), TRUE, &entry))
                 return Fail();
         }
         return true;
@@ -247,13 +299,14 @@ public:
 
     void Measure(MEASUREITEMSTRUCT& item) const
     {
+        const auto* entry = reinterpret_cast<const Item*>(item.itemData);
         item.itemWidth = width_;
-        item.itemHeight = height_;
+        item.itemHeight = entry && entry->kind == Kind::Separator ? separatorHeight_ : height_;
     }
 
     bool Draw(const DRAWITEMSTRUCT& item) const
     {
-        const auto* entry = reinterpret_cast<const MSAAMENUINFO*>(item.itemData);
+        const auto* entry = reinterpret_cast<const Item*>(item.itemData);
         if (!entry)
             return false;
         const int saved = SaveDC(item.hDC);
@@ -261,10 +314,20 @@ public:
             return false;
 
         const bool disabled = (item.itemState & (ODS_DISABLED | ODS_GRAYED)) != 0;
-        const bool selected = (item.itemState & ODS_SELECTED) != 0;
+        const bool selected = (item.itemState & ODS_SELECTED) != 0 && entry->kind == Kind::Command;
         const COLORREF ink = disabled ? disabledText_ : selected ? selectedText_ : foreground_;
         SetDCBrushColor(item.hDC, selected ? highlight_ : background_);
         FillRect(item.hDC, &item.rcItem, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        if (entry->kind == Kind::Separator)
+        {
+            const LONG middle = item.rcItem.top + (item.rcItem.bottom - item.rcItem.top) / 2;
+            const RECT line = {item.rcItem.left + Scale(4), middle, item.rcItem.right - Scale(4),
+                               middle + (std::max)(1, Scale(1))};
+            SetDCBrushColor(item.hDC, line_);
+            FillRect(item.hDC, &line, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+            RestoreDC(item.hDC, saved);
+            return true;
+        }
         SelectObject(item.hDC, font_);
         SetBkMode(item.hDC, TRANSPARENT);
         SetTextColor(item.hDC, ink);
@@ -272,7 +335,7 @@ public:
         RECT label = item.rcItem;
         label.left += Scale(32);
         label.right -= Scale(8);
-        DrawTextW(item.hDC, entry->pszWText, -1, &label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(item.hDC, entry->text, -1, &label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
         HPEN pen = nullptr;
         if (item.itemState & ODS_CHECKED)
